@@ -32,7 +32,7 @@ export GEMINI_API_KEY="your_api_key_here"
 
 ## Cách chạy
 
-### 1. Quét từ danh sách link Threads:
+### 1. Quét từ danh sách link Threads và xuất JSON kịch bản:
 ```bash
 python threads_scraper.py --urls "https://www.threads.net/@vietnam_crossover"
 ```
@@ -42,15 +42,29 @@ python threads_scraper.py --urls "https://www.threads.net/@vietnam_crossover"
 python threads_scraper.py --no-scrape
 ```
 
-### 3. Tích hợp dạng thư viện Python:
+### 3. Tự động tạo Video Shorts hoàn chỉnh (TTS + Giao diện Cards + Video nền):
+```bash
+# Tạo 1 video đơn lẻ
+python threads_video_builder.py --count 1
+
+# Tạo batch 5 video liên tiếp với watermark tùy chỉnh
+python threads_video_builder.py --count 5 --watermark "hamster kể chuyện"
+```
+
+> **Ghi chú về Video nền**: Hãy đặt video nền yêu thích của bạn (Minecraft parkour, gameplay, satisfying,...) vào đường dẫn `assets/background.mp4`. Hệ thống sẽ tự động crop và canh giữa theo chuẩn tỷ lệ 9:16 (1080x1920).
+
+### 4. Tích hợp dạng thư viện Python:
 ```python
 import asyncio
-from threads_scraper import get_automated_story
+from threads_scraper_ai import get_automated_story
+from threads_video_builder import render_story_video
 
 async def main():
-    urls = ["https://www.threads.net/@user1", "https://www.threads.net/@user2"]
+    urls = ["https://www.threads.net/search?q=chuy%E1%BB%87n%20h%C3%A0i"]
+    # 1. Cào bài và chọn câu chuyện bằng Gemini AI
     story = await get_automated_story(urls)
-    print(story)
+    # 2. Render thành video Shorts MP4 hoàn chỉnh
+    await render_story_video(story, output_file="my_viral_short.mp4")
 
 asyncio.run(main())
 ```

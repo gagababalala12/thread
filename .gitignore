@@ -5,3 +5,6 @@ __pycache__/
 story_history.json
 test_story_history.json
 .playwright/
+output_short*.mp4
+test_output_short.mp4
+temp_build_*/
