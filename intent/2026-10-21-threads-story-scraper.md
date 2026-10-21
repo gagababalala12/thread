@@ -1,5 +1,5 @@
 ---
-status: planned
+status: verified
 ---
 # Threads Story Scraper & Gemini AI Story Curation for Shorts
 

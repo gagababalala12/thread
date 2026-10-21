@@ -1,0 +1,258 @@
+import asyncio
+import json
+import os
+from typing import List, Optional
+from pathlib import Path
+from pydantic import BaseModel, Field
+from playwright.async_api import async_playwright
+from google import genai
+from google.genai import types
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+HISTORY_FILE = Path(__file__).resolve().parent / "story_history.json"
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+class ThreadCard(BaseModel):
+    card_id: int = Field(description="Số thứ tự khung bài đăng (1 hoặc 2)")
+    time_ago: str = Field(description="Thời gian đăng giả lập, ví dụ: '2 giờ', '1 giờ'")
+    likes: str = Field(description="Lượt tim giả lập hấp dẫn, ví dụ: '14,2K', '29,8K'")
+    replies: str = Field(description="Lượt bình luận giả lập, ví dụ: '382', '1.104'")
+    lines: List[str] = Field(
+        description="Danh sách đúng 3 câu ngắn gọn trong khung này. Câu cuối của card 2 phải là câu chốt hạ gây cười."
+    )
+
+
+class StorySelection(BaseModel):
+    selected_post_index: int = Field(description="Vị trí bài đăng được chọn trong danh sách")
+    humor_score: int = Field(description="Điểm độ hài hước và bất ngờ từ 1 đến 10")
+    cards: List[ThreadCard] = Field(description="Danh sách gồm đúng 2 card (Card 1 dẫn dắt, Card 2 chốt hạ)")
+
+
+def load_history() -> list:
+    history_path = Path(HISTORY_FILE)
+    if history_path.exists():
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                return json.loads(content) if content else []
+        except Exception as e:
+            print(f"[!] Không thể đọc file lịch sử ({e}), khởi tạo danh sách trống.")
+            return []
+    return []
+
+
+def save_history(new_title: str):
+    history = load_history()
+    history.append(new_title)
+    if len(history) > 50:
+        history = history[-50:]
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[!] Lỗi khi ghi lịch sử: {e}")
+
+
+async def scrape_threads_posts(urls: List[str], max_scrolls: int = 4) -> List[str]:
+    raw_posts = set()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="vi-VN",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = await context.new_page()
+
+        for url in urls:
+            print(f"[+] Đang quét dữ liệu từ: {url}")
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+
+                # Cố gắng đóng popup / modal đăng nhập nếu có
+                try:
+                    close_buttons = page.locator('div[role="dialog"] [aria-label="Close"], div[role="dialog"] button:has-text("Đóng")')
+                    if await close_buttons.count() > 0:
+                        await close_buttons.first.click()
+                        await asyncio.sleep(1)
+                except Exception:
+                    pass
+
+                for scroll_idx in range(max_scrolls):
+                    elements = await page.locator('div[dir="auto"]').all_inner_texts()
+                    for text in elements:
+                        cleaned = text.strip()
+                        if 80 <= len(cleaned) <= 650 and not cleaned.startswith("http"):
+                            raw_posts.add(cleaned)
+
+                    await page.mouse.wheel(0, 1800)
+                    await asyncio.sleep(2)
+
+                    # Bấm phím Escape để tắt các backdrop/overlay xuất hiện giữa chừng
+                    try:
+                        await page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                print(f"[!] Bỏ qua {url} do lỗi kết nối: {e}")
+
+        await browser.close()
+
+    return list(raw_posts)
+
+
+def select_and_format_story(
+    raw_posts: List[str],
+    api_key: Optional[str] = None,
+    model: str = DEFAULT_MODEL,
+) -> dict:
+    resolved_api_key = api_key or os.environ.get("GEMINI_API_KEY")
+    if not resolved_api_key:
+        raise ValueError(
+            "Chưa cấu hình GEMINI_API_KEY. Vui lòng truyền qua tham số api_key hoặc thiết lập biến môi trường GEMINI_API_KEY."
+        )
+
+    client = genai.Client(api_key=resolved_api_key)
+
+    history = load_history()
+    history_note = ""
+    if history:
+        history_note = (
+            "\nCÁC CÂU CHUYỆN ĐÃ LÀM TRƯỚC ĐÓ (TUYỆT ĐỐI KHÔNG LẶP LẠI NỘI DUNG HOẶC CHỦ ĐỀ NÀY):\n"
+            + "\n".join([f"- {h}" for h in history])
+        )
+
+    if not raw_posts:
+        posts_payload = (
+            "Hãy tự sáng tác 1 mẩu chuyện cười ngắn độc lạ khác hoàn toàn các chủ đề thông thường."
+        )
+    else:
+        formatted_list = "\n---\n".join([f"[Bài {i}]: {post}" for i, post in enumerate(raw_posts[:25])])
+        posts_payload = f"Danh sách các bài đăng vừa quét từ Threads:\n{formatted_list}"
+
+    prompt = f"""
+    Bạn là đạo diễn kịch bản kênh YouTube Shorts triệu view.
+    Nhiệm vụ:
+    1. Chọn 1 câu chuyện hài hước có twist mạnh ở cuối. 
+    {history_note}
+    2. Biên tập lại sang văn nói tiếng Việt tự nhiên, gãy gọn, không có emoji.
+    3. Chia thành đúng 2 khung (Card 1 mở bài/gây tò mò, Card 2 giải quyết và chốt hạ).
+    
+    {posts_payload}
+    """
+
+    print(f"[+] Đang gửi dữ liệu qua Gemini AI ({model}) để chấm điểm và tách câu...")
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=StorySelection,
+                temperature=0.85,
+            ),
+        )
+    except Exception as e:
+        # Fallback sang model ổn định nếu model được chỉ định bị lỗi phiên bản
+        if model != "gemini-3.8-flash":
+            print(f"[!] Gặp lỗi với model {model}: {e}. Đang thử fallback sang gemini-3.8-flash...")
+            response = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=StorySelection,
+                    temperature=0.85,
+                ),
+            )
+        else:
+            raise
+
+    # Trích xuất dữ liệu trả về từ Gemini
+    if hasattr(response, "parsed") and response.parsed is not None:
+        if isinstance(response.parsed, StorySelection):
+            result_data = response.parsed.model_dump()
+        else:
+            result_data = response.parsed
+    else:
+        result_data = json.loads(response.text)
+
+    # Lưu lại lịch sử câu mở đầu
+    cards = result_data.get("cards", [])
+    if cards and len(cards) > 0:
+        lines = cards[0].get("lines", [])
+        if lines:
+            save_history(lines[0])
+
+    print(f"[✓] Gemini đã chọn kịch bản (Điểm hài hước: {result_data.get('humor_score', 'N/A')}/10)")
+    return {"cards": cards, "humor_score": result_data.get("humor_score")}
+
+
+async def get_automated_story(
+    target_urls: List[str],
+    api_key: Optional[str] = None,
+    model: str = DEFAULT_MODEL,
+) -> dict:
+    raw_posts = await scrape_threads_posts(target_urls)
+    story_data = select_and_format_story(raw_posts, api_key=api_key, model=model)
+    return story_data
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Threads Story Scraper & Gemini AI Story Formatter for YouTube Shorts"
+    )
+    parser.add_argument(
+        "--urls",
+        nargs="+",
+        default=[],
+        help="Danh sách URL bài đăng hoặc trang Threads cần quét",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Model Gemini sử dụng (mặc định: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--no-scrape",
+        action="store_true",
+        help="Không quét Threads, yêu cầu Gemini tự sáng tác trực tiếp",
+    )
+    args = parser.parse_args()
+
+    async def main():
+        urls = args.urls
+        if args.no_scrape or not urls:
+            if not urls and not args.no_scrape:
+                print("[!] Chưa chỉ định URLs. Chạy chế độ sáng tác tự động (hoặc truyền --urls).")
+            result = select_and_format_story([], model=args.model)
+        else:
+            result = await get_automated_story(urls, model=args.model)
+
+        print("\n" + "=" * 50)
+        print("🎉 KẾT QUẢ KỊCH BẢN 2 CARD:")
+        print("=" * 50)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    asyncio.run(main())

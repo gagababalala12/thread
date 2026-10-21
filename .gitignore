@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+story_history.json
+test_story_history.json
+.playwright/
