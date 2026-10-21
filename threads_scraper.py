@@ -15,7 +15,7 @@ except ImportError:
     pass
 
 HISTORY_FILE = Path(__file__).resolve().parent / "story_history.json"
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 
 class ThreadCard(BaseModel):
@@ -160,23 +160,18 @@ def select_and_format_story(
     {posts_payload}
     """
 
-    print(f"[+] Đang gửi dữ liệu qua Gemini AI ({model}) để chấm điểm và tách câu...")
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=StorySelection,
-                temperature=0.85,
-            ),
-        )
-    except Exception as e:
-        # Fallback sang model ổn định nếu model được chỉ định bị lỗi phiên bản
-        if model != "gemini-3.8-flash":
-            print(f"[!] Gặp lỗi với model {model}: {e}. Đang thử fallback sang gemini-3.8-flash...")
+    candidate_models = [model]
+    for fallback_m in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"]:
+        if fallback_m not in candidate_models:
+            candidate_models.append(fallback_m)
+
+    response = None
+    last_error = None
+    for current_model in candidate_models:
+        print(f"[+] Đang gửi dữ liệu qua Gemini AI ({current_model}) để chấm điểm và tách câu...")
+        try:
             response = client.models.generate_content(
-                model="gemini-3.8-flash",
+                model=current_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -184,8 +179,14 @@ def select_and_format_story(
                     temperature=0.85,
                 ),
             )
-        else:
-            raise
+            if response:
+                break
+        except Exception as e:
+            print(f"[!] Gặp lỗi với model {current_model}: {e}. Đang thử model kế tiếp...")
+            last_error = e
+
+    if not response:
+        raise last_error
 
     # Trích xuất dữ liệu trả về từ Gemini
     if hasattr(response, "parsed") and response.parsed is not None:
