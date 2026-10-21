@@ -163,15 +163,20 @@ def crop_to_9_16(clip, target_w=1080, target_h=1920):
     return clip.resized((target_w, target_h)) if MOVIEPY_V2 else clip.resize((target_w, target_h))
 
 
-async def generate_tts(text: str, output_path: Path, max_retries: int = 3):
+async def generate_tts(text: str, output_path: Path, max_retries: int = 5):
+    voices = [CONFIG["voice"], "vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]
     for attempt in range(max_retries):
+        voice = voices[attempt % len(voices)]
         try:
-            communicate = edge_tts.Communicate(text=text, voice=CONFIG["voice"], rate=CONFIG["voice_rate"])
+            communicate = edge_tts.Communicate(text=text, voice=voice, rate=CONFIG["voice_rate"])
             await communicate.save(str(output_path))
-            return
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return
         except Exception as e:
             if attempt < max_retries - 1:
-                await asyncio.sleep(0.8 * (attempt + 1))
+                wait_time = 1.5 * (attempt + 1)
+                print(f"[!] TTS thử lại lần {attempt + 1} sau {wait_time:.1f}s cho câu: '{text[:30]}...'")
+                await asyncio.sleep(wait_time)
             else:
                 raise
 
@@ -213,7 +218,7 @@ async def prepare_media_assets(story_data: dict, temp_dir: Path):
 
                 audio_path = temp_dir / f"{step_name}.mp3"
                 await generate_tts(line, audio_path)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)
                 trim_audio_silence(audio_path)
 
                 html_content = build_threads_html(
@@ -326,24 +331,91 @@ async def render_story_video(story_data: dict, output_file: str = "output_short.
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+SAMPLE_STORIES = [
+    {
+        "humor_score": 9,
+        "cards": [
+            {
+                "card_id": 1,
+                "time_ago": "2 giờ",
+                "likes": "18,4K",
+                "replies": "412",
+                "lines": [
+                    "Sáng nay đi phỏng vấn xin việc ở công ty lớn.",
+                    "Người phỏng vấn hỏi: 'Điểm yếu lớn nhất của em là gì?'",
+                    "Tôi tự tin đáp: 'Dạ, em quá trung thực ạ!'"
+                ]
+            },
+            {
+                "card_id": 2,
+                "time_ago": "2 giờ",
+                "likes": "18,4K",
+                "replies": "412",
+                "lines": [
+                    "Sếp bảo: 'Tôi không nghĩ trung thực là một điểm yếu.'",
+                    "Tôi nhìn thẳng vào mắt sếp và mỉm cười nhẹ...",
+                    "Tôi đáp: 'Em cũng đâu có quan tâm sếp nghĩ thế nào đâu!'"
+                ]
+            }
+        ]
+    },
+    {
+        "humor_score": 9,
+        "cards": [
+            {
+                "card_id": 1,
+                "time_ago": "1 giờ",
+                "likes": "24,8K",
+                "replies": "652",
+                "lines": [
+                    "Hôm nay dắt cún cưng đi dạo ở công viên.",
+                    "Bỗng một bạn nữ cực xinh chạy lại vẫy tay.",
+                    "Bạn ấy cười tươi hỏi: 'Anh ơi cho em xin info với...'"
+                ]
+            },
+            {
+                "card_id": 2,
+                "time_ago": "1 giờ",
+                "likes": "24,8K",
+                "replies": "652",
+                "lines": [
+                    "Tôi ngại ngùng đưa điện thoại định bật mã QR...",
+                    "Thì bạn ấy bảo: 'Ý em là xin info chú cún nhà anh!'",
+                    "'Để phối giống với con cún cái bồ cũ em vừa tặng!'"
+                ]
+            }
+        ]
+    }
+]
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Threads Shorts Video Builder")
     parser.add_argument("--count", type=int, default=1, help="Số lượng video cần tạo (mặc định: 1)")
     parser.add_argument("--urls", nargs="+", default=TARGET_THREADS_URLS, help="Danh sách URL Threads cần quét")
     parser.add_argument("--watermark", default=CONFIG["channel_watermark"], help="Watermark kênh")
     parser.add_argument("--voice", default=CONFIG["voice"], help="Giọng đọc edge-tts")
+    parser.add_argument("--mock", action="store_true", help="Dùng kịch bản mẫu (không cần API key)")
     args = parser.parse_args()
 
     CONFIG["channel_watermark"] = args.watermark
     CONFIG["voice"] = args.voice
 
     total_videos = args.count
+    api_key = os.environ.get("GEMINI_API_KEY")
+
     for i in range(1, total_videos + 1):
         print(f"\n========================================")
         print(f"🎬 ĐANG XỬ LÝ VIDEO THỨ {i} / {total_videos}")
         print(f"========================================")
 
-        story_data = await get_automated_story(args.urls, api_key=os.environ.get("GEMINI_API_KEY"))
+        if args.mock or not api_key:
+            if not api_key and not args.mock:
+                print("[!] Chưa cấu hình GEMINI_API_KEY trong môi trường. Đang sử dụng kịch bản viral mẫu...")
+            story_data = SAMPLE_STORIES[(i - 1) % len(SAMPLE_STORIES)]
+        else:
+            story_data = await get_automated_story(args.urls, api_key=api_key)
+
         out_name = f"output_short_batch_{i}.mp4" if total_videos > 1 else "output_short.mp4"
         await render_story_video(story_data, output_file=out_name)
 
