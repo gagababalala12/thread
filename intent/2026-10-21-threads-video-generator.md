@@ -1,5 +1,5 @@
 ---
-status: verified
+status: shipped
 ---
 # Threads Story Shorts Video Generator
 
