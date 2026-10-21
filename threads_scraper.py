@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 from typing import List, Optional
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -16,6 +17,40 @@ except ImportError:
 
 HISTORY_FILE = Path(__file__).resolve().parent / "story_history.json"
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+VIETNAMESE_ABBREVIATIONS = {
+    r"\b(ko|k|khg)\b": "không",
+    r"\b(dc|đc)\b": "được",
+    r"\bhlv\b": "huấn luyện viên",
+    r"\bvs\b": "với",
+    r"\bj\b": "gì",
+    r"\b(bt|bthg)\b": "bình thường",
+    r"\bmn\b": "mọi người",
+    r"\bntn\b": "như thế nào",
+    r"\btks\b": "cảm ơn",
+    r"\bthx\b": "cảm ơn",
+    r"\bhnay\b": "hôm nay",
+    r"\bnhiu\b": "nhiều",
+    r"\bah\b": "ạ",
+    r"\boh\b": "ồ",
+}
+
+
+def normalize_vietnamese_text(text: str) -> str:
+    """Chuẩn hóa văn bản tiếng Việt UTF-8: thay thế toàn bộ từ viết tắt bằng từ tiếng Việt đầy đủ có dấu."""
+    if not text:
+        return text
+    result = text
+    for pattern, replacement in VIETNAMESE_ABBREVIATIONS.items():
+        def replace_match(m):
+            w = m.group(0)
+            if w.isupper():
+                return replacement.upper()
+            if w[0].isupper():
+                return replacement.capitalize()
+            return replacement
+        result = re.sub(pattern, replace_match, result, flags=re.IGNORECASE)
+    return result
 
 
 class ThreadCard(BaseModel):
@@ -152,10 +187,11 @@ def select_and_format_story(
     prompt = f"""
     Bạn là đạo diễn kịch bản kênh YouTube Shorts triệu view.
     Nhiệm vụ:
-    1. Chọn 1 câu chuyện hài hước có twist mạnh ở cuối. 
+    1. Chọn hoặc sáng tác 1 câu chuyện hài hước có cú twist mạnh và bất ngờ ở câu cuối cùng.
     {history_note}
-    2. Biên tập lại sang văn nói tiếng Việt tự nhiên, gãy gọn, không có emoji.
-    3. Chia thành đúng 2 khung (Card 1 mở bài/gây tò mò, Card 2 giải quyết và chốt hạ).
+    2. Toàn bộ chuỗi văn bản tiếng Việt bắt buộc phải có đầy đủ dấu tiếng Việt chuẩn UTF-8. Tuyệt đối KHÔNG viết tiếng Việt không dấu và KHÔNG dùng từ viết tắt (như "hlv", "ko", "dc", "vs", "j").
+    3. Biên tập lại sang văn nói tiếng Việt tự nhiên, gãy gọn, không có emoji.
+    4. Chia thành đúng 2 khung (Card 1 mở bài/gây tò mò gồm 3 câu, Card 2 giải quyết và chốt hạ gồm 3 câu; câu thứ 3 của Card 2 bắt buộc là cú twist đắt giá gây cười).
     
     {posts_payload}
     """
@@ -170,7 +206,7 @@ def select_and_format_story(
     for current_model in candidate_models:
         print(f"[+] Đang gửi dữ liệu qua Gemini AI ({current_model}) để chấm điểm và tách câu...")
         try:
-            response = client.models.generate_content(
+            resp = client.models.generate_content(
                 model=current_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -179,7 +215,8 @@ def select_and_format_story(
                     temperature=0.85,
                 ),
             )
-            if response:
+            if resp and (getattr(resp, "parsed", None) is not None or (getattr(resp, "text", None) and resp.text.strip())):
+                response = resp
                 break
         except Exception as e:
             print(f"[!] Gặp lỗi với model {current_model}: {e}. Đang thử model kế tiếp...")
@@ -197,10 +234,18 @@ def select_and_format_story(
     else:
         result_data = json.loads(response.text)
 
-    # Lưu lại lịch sử câu mở đầu
+    # Chuẩn hóa toàn bộ câu chữ trong cards: xóa bỏ từ viết tắt, đảm bảo dấu tiếng Việt
     cards = result_data.get("cards", [])
+    for card in cards:
+        if isinstance(card, dict):
+            raw_lines = card.get("lines", [])
+            card["lines"] = [normalize_vietnamese_text(l) for l in raw_lines]
+        elif hasattr(card, "lines"):
+            card.lines = [normalize_vietnamese_text(l) for l in card.lines]
+
+    # Lưu lại lịch sử câu mở đầu
     if cards and len(cards) > 0:
-        lines = cards[0].get("lines", [])
+        lines = cards[0].get("lines", []) if isinstance(cards[0], dict) else getattr(cards[0], "lines", [])
         if lines:
             save_history(lines[0])
 
@@ -214,6 +259,8 @@ async def get_automated_story(
     model: str = DEFAULT_MODEL,
 ) -> dict:
     raw_posts = await scrape_threads_posts(target_urls)
+    if not raw_posts:
+        raise RuntimeError("Chưa quét được bài từ Threads (danh sách bài đăng trống).")
     story_data = select_and_format_story(raw_posts, api_key=api_key, model=model)
     return story_data
 

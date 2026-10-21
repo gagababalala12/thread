@@ -11,6 +11,8 @@ from threads_scraper import (
     load_history,
     save_history,
     select_and_format_story,
+    get_automated_story,
+    normalize_vietnamese_text,
     HISTORY_FILE,
 )
 
@@ -139,6 +141,23 @@ class TestThreadsScraper(unittest.TestCase):
         self.assertEqual(result["humor_score"], 8)
         # Kiểm tra đã lưu câu mở đầu vào lịch sử
         self.assertIn("Mở bài 1", load_history())
+
+    def test_normalize_vietnamese_text_expands_abbreviations(self):
+        sample = "Tôi ko hiểu sao hlv bảo dc vs lại làm j thế"
+        normalized = normalize_vietnamese_text(sample)
+        self.assertEqual(normalized, "Tôi không hiểu sao huấn luyện viên bảo được với lại làm gì thế")
+
+        # Test case preservation
+        upper_sample = "KO DC HLV"
+        self.assertEqual(normalize_vietnamese_text(upper_sample), "KHÔNG ĐƯỢC HUẤN LUYỆN VIÊN")
+
+    @patch("threads_scraper.scrape_threads_posts")
+    def test_get_automated_story_empty_raises_runtime_error(self, mock_scrape):
+        mock_scrape.return_value = []
+        import asyncio
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(get_automated_story(["https://example.com"]))
+        self.assertIn("Chưa quét được bài từ Threads", str(ctx.exception))
 
 
 if __name__ == "__main__":
