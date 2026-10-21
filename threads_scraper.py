@@ -2,9 +2,9 @@ import asyncio
 import json
 import os
 import re
-from typing import List, Optional
+from typing import List, Optional, Literal, Union
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from playwright.async_api import async_playwright
 from google import genai
 from google.genai import types
@@ -53,20 +53,114 @@ def normalize_vietnamese_text(text: str) -> str:
     return result
 
 
+class StoryLine(BaseModel):
+    text: str = Field(description="Nội dung câu thoại (tiếng Việt có dấu đầy đủ, không viết tắt).")
+    voice: Literal["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"] = Field(
+        default="vi-VN-HoaiMyNeural",
+        description="Giọng đọc: 'vi-VN-HoaiMyNeural' (nữ) hoặc 'vi-VN-NamMinhNeural' (nam) tùy theo nhân vật đang nói."
+    )
+    sfx_after: Literal["none", "huh", "cai_gi_do", "laugh", "vine_boom", "wow"] = Field(
+        default="none",
+        description="Hiệu ứng âm thanh phát ngay sau khi đọc xong câu đó từ danh sách ['none', 'huh', 'cai_gi_do', 'laugh', 'vine_boom', 'wow']."
+    )
+
+    @field_validator("voice", mode="before")
+    @classmethod
+    def normalize_voice(cls, v):
+        if not v or not isinstance(v, str):
+            return "vi-VN-HoaiMyNeural"
+        vl = v.lower().strip()
+        if "female" in vl or "hoai" in vl or "nu" in vl or "nữ" in vl:
+            return "vi-VN-HoaiMyNeural"
+        if "nam" in vl or "male" in vl:
+            return "vi-VN-NamMinhNeural"
+        if v in ("vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"):
+            return v
+        return "vi-VN-HoaiMyNeural"
+
+    @field_validator("sfx_after", mode="before")
+    @classmethod
+    def normalize_sfx_after(cls, v):
+        if not v or not isinstance(v, str):
+            return "none"
+        vl = v.lower().strip()
+        for ext in (".mp3", ".wav", ".aac", ".ogg"):
+            if vl.endswith(ext):
+                vl = vl[:-len(ext)].strip()
+        if vl in ("huh", "cai_gi_do", "laugh", "vine_boom", "wow"):
+            return vl
+        if vl in ("caigido", "cai gi do"):
+            return "cai_gi_do"
+        if vl in ("vineboom", "vine boom"):
+            return "vine_boom"
+        return "none"
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.text == other
+        if isinstance(other, StoryLine):
+            return (self.text, self.voice, self.sfx_after) == (other.text, other.voice, other.sfx_after)
+        return False
+
+    def __str__(self):
+        return self.text
+
+    def lower(self):
+        return self.text.lower()
+
+    def __getitem__(self, key):
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def keys(self):
+        return ["text", "voice", "sfx_after"]
+
+    def items(self):
+        return [("text", self.text), ("voice", self.voice), ("sfx_after", self.sfx_after)]
+
+
 class ThreadCard(BaseModel):
     card_id: int = Field(description="Số thứ tự khung bài đăng (1 hoặc 2)")
     time_ago: str = Field(description="Thời gian đăng giả lập, ví dụ: '2 giờ', '1 giờ'")
     likes: str = Field(description="Lượt tim giả lập hấp dẫn, ví dụ: '14,2K', '29,8K'")
     replies: str = Field(description="Lượt bình luận giả lập, ví dụ: '382', '1.104'")
-    lines: List[str] = Field(
-        description="Danh sách đúng 3 câu ngắn gọn trong khung này. Câu cuối của card 2 phải là câu chốt hạ gây cười."
+    lines: List[StoryLine] = Field(
+        description="Danh sách đúng 3 câu StoryLine trong khung này. Câu cuối của card 2 phải là câu chốt hạ gây cười."
     )
+    use_video_meme_outro: bool = Field(
+        default=True,
+        description="Chèn clip video meme reaction vào cuối video sau câu chốt hạ của Card 2."
+    )
+
+    @field_validator("lines", mode="before")
+    @classmethod
+    def convert_lines(cls, v):
+        if not isinstance(v, list):
+            return v
+        converted = []
+        for item in v:
+            if isinstance(item, str):
+                converted.append(StoryLine(text=item, voice="vi-VN-HoaiMyNeural", sfx_after="none"))
+            elif isinstance(item, dict):
+                converted.append(StoryLine(**item))
+            else:
+                converted.append(item)
+        return converted
 
 
 class StorySelection(BaseModel):
     selected_post_index: int = Field(description="Vị trí bài đăng được chọn trong danh sách")
     humor_score: int = Field(description="Điểm độ hài hước và bất ngờ từ 1 đến 10")
+    title: Optional[str] = Field(default="Kịch bản viral", description="Tiêu đề câu chuyện")
     cards: List[ThreadCard] = Field(description="Danh sách gồm đúng 2 card (Card 1 dẫn dắt, Card 2 chốt hạ)")
+    use_video_meme_outro: bool = Field(
+        default=True,
+        description="Chèn clip video meme reaction vào cuối video sau câu chốt hạ của Card 2."
+    )
 
 
 def load_history() -> list:
@@ -185,13 +279,24 @@ def select_and_format_story(
         posts_payload = f"Danh sách các bài đăng vừa quét từ Threads:\n{formatted_list}"
 
     prompt = f"""
-    Bạn là đạo diễn kịch bản kênh YouTube Shorts triệu view.
+    Bạn là đạo diễn kịch bản kiêm đạo diễn âm thanh cho kênh YouTube Shorts triệu view (phong cách Động Threads).
     Nhiệm vụ:
     1. Chọn hoặc sáng tác 1 câu chuyện hài hước có cú twist mạnh và bất ngờ ở câu cuối cùng.
     {history_note}
     2. Toàn bộ chuỗi văn bản tiếng Việt bắt buộc phải có đầy đủ dấu tiếng Việt chuẩn UTF-8. Tuyệt đối KHÔNG viết tiếng Việt không dấu và KHÔNG dùng từ viết tắt (như "hlv", "ko", "dc", "vs", "j").
     3. Biên tập lại sang văn nói tiếng Việt tự nhiên, gãy gọn, không có emoji.
     4. Chia thành đúng 2 khung (Card 1 mở bài/gây tò mò gồm 3 câu, Card 2 giải quyết và chốt hạ gồm 3 câu; câu thứ 3 của Card 2 bắt buộc là cú twist đắt giá gây cười).
+    5. Đạo diễn đa giọng đọc và âm thanh SFX cho từng câu (StoryLine):
+       - text: Nội dung câu thoại tiếng Việt đầy đủ dấu.
+       - voice: Chọn "vi-VN-HoaiMyNeural" (nữ) hoặc "vi-VN-NamMinhNeural" (nam) tùy nhân vật đang nói để tạo hội thoại sinh động giữa các nhân vật (ví dụ: mẹ/cô giáo/bạn gái chọn giọng nữ; bố/thầy giáo/bạn trai chọn giọng nam; người dẫn chuyện có thể chọn 1 trong 2).
+       - sfx_after: Tự chọn hiệu ứng âm thanh phát ngay sau khi đọc xong câu đó từ danh sách ["none", "huh", "cai_gi_do", "laugh", "vine_boom", "wow"] sao cho khớp cảm xúc câu chuyện:
+         * "huh": Sau câu hỏi ngơ ngác, thắc mắc, bối rối.
+         * "cai_gi_do": Sau câu trả lời bất ngờ, lạ lùng hoặc ngớ ngẩn.
+         * "laugh": Sau câu đùa dí dỏm hoặc chi tiết buồn cười.
+         * "vine_boom": Sau câu twist cú chót hoặc tình huống sốc, vỡ mộng.
+         * "wow": Sau lời khen hoặc chi tiết gây trầm trồ.
+         * "none": Các câu bình thường không cần SFX.
+    6. Thiết lập use_video_meme_outro: true để chèn clip meme reaction vào cuối video.
     
     {posts_payload}
     """
@@ -239,18 +344,35 @@ def select_and_format_story(
     for card in cards:
         if isinstance(card, dict):
             raw_lines = card.get("lines", [])
-            card["lines"] = [normalize_vietnamese_text(l) for l in raw_lines]
+            for l in raw_lines:
+                if isinstance(l, dict):
+                    l["text"] = normalize_vietnamese_text(l.get("text", ""))
+                elif hasattr(l, "text"):
+                    l.text = normalize_vietnamese_text(l.text)
         elif hasattr(card, "lines"):
-            card.lines = [normalize_vietnamese_text(l) for l in card.lines]
+            for l in card.lines:
+                if hasattr(l, "text"):
+                    l.text = normalize_vietnamese_text(l.text)
+                elif isinstance(l, dict):
+                    l["text"] = normalize_vietnamese_text(l.get("text", ""))
 
     # Lưu lại lịch sử câu mở đầu
     if cards and len(cards) > 0:
-        lines = cards[0].get("lines", []) if isinstance(cards[0], dict) else getattr(cards[0], "lines", [])
-        if lines:
-            save_history(lines[0])
+        first_card = cards[0]
+        raw_lines = first_card.get("lines", []) if isinstance(first_card, dict) else getattr(first_card, "lines", [])
+        if raw_lines:
+            first_l = raw_lines[0]
+            first_text = first_l.get("text") if isinstance(first_l, dict) else getattr(first_l, "text", str(first_l))
+            if first_text:
+                save_history(first_text)
 
     print(f"[✓] Gemini đã chọn kịch bản (Điểm hài hước: {result_data.get('humor_score', 'N/A')}/10)")
-    return {"cards": cards, "humor_score": result_data.get("humor_score")}
+    return {
+        "title": result_data.get("title", "Kịch bản viral"),
+        "cards": cards,
+        "humor_score": result_data.get("humor_score"),
+        "use_video_meme_outro": result_data.get("use_video_meme_outro", True),
+    }
 
 
 async def get_automated_story(
@@ -263,6 +385,22 @@ async def get_automated_story(
         raise RuntimeError("Chưa quét được bài từ Threads (danh sách bài đăng trống).")
     story_data = select_and_format_story(raw_posts, api_key=api_key, model=model)
     return story_data
+
+
+__all__ = [
+    "StoryLine",
+    "ThreadCard",
+    "StorySelection",
+    "normalize_vietnamese_text",
+    "load_history",
+    "save_history",
+    "scrape_threads_posts",
+    "select_and_format_story",
+    "get_automated_story",
+    "HISTORY_FILE",
+    "DEFAULT_MODEL",
+    "VIETNAMESE_ABBREVIATIONS",
+]
 
 
 if __name__ == "__main__":

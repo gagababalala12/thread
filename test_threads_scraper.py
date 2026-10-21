@@ -159,6 +159,107 @@ class TestThreadsScraper(unittest.TestCase):
             asyncio.run(get_automated_story(["https://example.com"]))
         self.assertIn("Chưa quét được bài từ Threads", str(ctx.exception))
 
+    def test_story_line_schema(self):
+        from threads_scraper import StoryLine
+        line = StoryLine(text="Chào mọi người", voice="vi-VN-NamMinhNeural", sfx_after="huh")
+        self.assertEqual(line.text, "Chào mọi người")
+        self.assertEqual(line.voice, "vi-VN-NamMinhNeural")
+        self.assertEqual(line.sfx_after, "huh")
+        # Check dict access
+        self.assertEqual(line["voice"], "vi-VN-NamMinhNeural")
+        self.assertEqual(line.get("sfx_after"), "huh")
+        # Check str equivalence and lower
+        self.assertEqual(line, "Chào mọi người")
+        self.assertEqual(line.lower(), "chào mọi người")
+
+    def test_thread_card_with_story_lines(self):
+        from threads_scraper import StoryLine
+        card = ThreadCard(
+            card_id=1,
+            time_ago="1 giờ",
+            likes="10K",
+            replies="150",
+            lines=[
+                StoryLine(text="Câu 1", voice="vi-VN-HoaiMyNeural", sfx_after="none"),
+                StoryLine(text="Câu 2", voice="vi-VN-NamMinhNeural", sfx_after="cai_gi_do"),
+                StoryLine(text="Câu 3", voice="vi-VN-NamMinhNeural", sfx_after="vine_boom"),
+            ],
+            use_video_meme_outro=True,
+        )
+        self.assertEqual(len(card.lines), 3)
+        self.assertEqual(card.lines[1].voice, "vi-VN-NamMinhNeural")
+        self.assertEqual(card.lines[1].sfx_after, "cai_gi_do")
+        self.assertTrue(card.use_video_meme_outro)
+
+    def test_story_selection_with_meme_outro(self):
+        from threads_scraper import StoryLine
+        selection = StorySelection(
+            selected_post_index=0,
+            humor_score=10,
+            use_video_meme_outro=True,
+            cards=[
+                ThreadCard(
+                    card_id=1,
+                    time_ago="1 giờ",
+                    likes="10K",
+                    replies="150",
+                    lines=["Câu 1", "Câu 2", "Câu 3"],
+                ),
+                ThreadCard(
+                    card_id=2,
+                    time_ago="1 giờ",
+                    likes="10K",
+                    replies="150",
+                    lines=[
+                        StoryLine(text="Câu 4", voice="vi-VN-NamMinhNeural", sfx_after="none"),
+                        StoryLine(text="Câu 5", voice="vi-VN-HoaiMyNeural", sfx_after="none"),
+                        StoryLine(text="Câu 6", voice="vi-VN-NamMinhNeural", sfx_after="vine_boom"),
+                    ],
+                ),
+            ],
+        )
+        self.assertTrue(selection.use_video_meme_outro)
+        self.assertEqual(selection.cards[1].lines[2].sfx_after, "vine_boom")
+
+    def test_module_sync_threads_scraper_ai(self):
+        import threads_scraper
+        import threads_scraper_ai
+
+        for attr in ["StoryLine", "ThreadCard", "StorySelection", "get_automated_story", "select_and_format_story"]:
+            self.assertTrue(hasattr(threads_scraper_ai, attr), f"threads_scraper_ai thiếu symbol {attr}")
+            self.assertIs(getattr(threads_scraper, attr), getattr(threads_scraper_ai, attr))
+
+    def test_story_line_normalization(self):
+        from threads_scraper import StoryLine
+        # Test fuzzy voice values
+        l1 = StoryLine(text="Chào bạn", voice="nam", sfx_after="huh.mp3")
+        self.assertEqual(l1.voice, "vi-VN-NamMinhNeural")
+        self.assertEqual(l1.sfx_after, "huh")
+
+        l2 = StoryLine(text="Chào anh", voice="nữ", sfx_after="CAI GI DO")
+        self.assertEqual(l2.voice, "vi-VN-HoaiMyNeural")
+        self.assertEqual(l2.sfx_after, "cai_gi_do")
+
+        l3 = StoryLine(text="Bất ngờ chưa", voice="female", sfx_after="vineboom.wav")
+        self.assertEqual(l3.voice, "vi-VN-HoaiMyNeural")
+        self.assertEqual(l3.sfx_after, "vine_boom")
+
+        # Unknown sfx should default to "none" rather than crashing
+        l4 = StoryLine(text="Bình thường thôi", voice="unknown_voice", sfx_after="invalid_sound")
+        self.assertEqual(l4.voice, "vi-VN-HoaiMyNeural")
+        self.assertEqual(l4.sfx_after, "none")
+
+    def test_thread_card_default_use_video_meme_outro(self):
+        card = ThreadCard(
+            card_id=1,
+            time_ago="1 giờ",
+            likes="10K",
+            replies="200",
+            lines=["C1", "C2", "C3"],
+        )
+        self.assertTrue(card.use_video_meme_outro)
+
 
 if __name__ == "__main__":
     unittest.main()
+

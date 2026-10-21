@@ -181,5 +181,80 @@ class TestThreadsVideoBuilder(unittest.TestCase):
         asyncio.run(verify_heights())
 
 
+    def test_sample_stories_multi_voice_and_sfx(self):
+        from threads_video_builder import SAMPLE_STORIES
+
+        valid_voices = {"vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"}
+        valid_sfx = {"none", "huh", "cai_gi_do", "laugh", "vine_boom", "wow"}
+
+        for story in SAMPLE_STORIES:
+            self.assertTrue(story.get("use_video_meme_outro", False), f"Story '{story.get('title')}' phải có use_video_meme_outro=True")
+            voices_in_story = set()
+            sfx_in_story = set()
+
+            for card in story["cards"]:
+                for line in card["lines"]:
+                    voice = line.voice if hasattr(line, "voice") else line.get("voice")
+                    sfx = line.sfx_after if hasattr(line, "sfx_after") else line.get("sfx_after")
+
+                    self.assertIn(voice, valid_voices, f"Voice không hợp lệ: {voice}")
+                    self.assertIn(sfx, valid_sfx, f"SFX không hợp lệ: {sfx}")
+
+                    voices_in_story.add(voice)
+                    if sfx != "none":
+                        sfx_in_story.add(sfx)
+
+            # Đảm bảo mỗi câu chuyện đều có hội thoại đa giọng (ít nhất 2 giọng đọc)
+            self.assertGreaterEqual(len(voices_in_story), 2, f"Story '{story.get('title')}' phải có đa giọng đọc (Nam/Nữ)")
+            # Đảm bảo có ít nhất 2 hiệu ứng SFX khác nhau trong câu chuyện
+            self.assertGreaterEqual(len(sfx_in_story), 2, f"Story '{story.get('title')}' phải có ít nhất 2 SFX meme")
+
+    def test_moviepy_volume_and_resize_helpers(self):
+        from moviepy import ColorClip
+        from threads_video_builder import clip_set_volume, clip_resize_width
+
+        clip = ColorClip(size=(800, 600), color=(50, 50, 50), duration=2)
+        v_clip = clip_set_volume(clip, 0.12)
+        self.assertIsNotNone(v_clip)
+
+        resized = clip_resize_width(clip, 750)
+        self.assertEqual(resized.size[0], 750)
+
+    def test_auto_threads_video_module_sync(self):
+        import threads_video_builder
+        import auto_threads_video
+
+        for attr in ["build_final_video", "render_story_video", "SAMPLE_STORIES", "CONFIG"]:
+            self.assertTrue(hasattr(auto_threads_video, attr), f"auto_threads_video thiếu symbol {attr}")
+            self.assertIs(getattr(threads_video_builder, attr), getattr(auto_threads_video, attr))
+
+    def test_meme_outro_positioning_strictly_below_card_for_all_heights(self):
+        # Kiểm tra tính toán vị trí meme outro không bao giờ đè lên card với nhiều kích cỡ card khác nhau
+        video_h = 1920
+        test_card_heights = [600, 651, 710, 770, 820]
+        test_meme_heights = [360, 422, 616, 750]
+
+        for card_h in test_card_heights:
+            card_bottom = (video_h + card_h) / 2
+            for raw_meme_h in test_meme_heights:
+                # Nếu meme_h > 440, code sẽ crop về 16:9 (422px)
+                meme_h = 422 if raw_meme_h > 440 else raw_meme_h
+                pos_y = int(card_bottom + 25)
+                if pos_y + meme_h > 1880:
+                    pos_y = max(int(card_bottom + 10), 1880 - meme_h)
+
+                # 1. Phải nằm hoàn toàn bên dưới card
+                self.assertGreaterEqual(
+                    pos_y, card_bottom + 10,
+                    f"Meme bị đè lên card (card_h={card_h}, meme_h={meme_h}): pos_y={pos_y} <= card_bottom={card_bottom}"
+                )
+                # 2. Phải nằm trong khung hình video 1920
+                self.assertLessEqual(
+                    pos_y + meme_h, video_h,
+                    f"Meme vượt khỏi khung hình (pos_y + meme_h = {pos_y + meme_h} > {video_h})"
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
+

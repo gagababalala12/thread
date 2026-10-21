@@ -6,14 +6,15 @@ import argparse
 import html
 import base64
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 import requests
 import yt_dlp
 import edge_tts
 from playwright.async_api import async_playwright
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
-from threads_scraper import get_automated_story, normalize_vietnamese_text
+from threads_scraper import get_automated_story, normalize_vietnamese_text, StoryLine
+from meme_harvester import harvest_all
 
 try:
     from dotenv import load_dotenv
@@ -62,7 +63,7 @@ def ensure_real_sfx(assets_dir: Path = Path("assets"), force: bool = False):
 
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # 1. Bubble Pop thật (file mẫu thật > 2KB, file beep giả cũ < 1.5KB)
+    # 1. Bubble Pop thật (file mẫu thật > 2KB)
     if force or not pop_path.exists() or pop_path.stat().st_size < 2000:
         print("[+] Đang tải hiệu ứng âm thanh Bubble Pop thật vào assets/pop.mp3...")
         pop_urls = [
@@ -121,14 +122,13 @@ def download_minecraft_background(
     force: bool = False
 ) -> Path:
     output_path = Path(output_path)
-    # File video thật 1-3 phút > 5MB, file dummy cũ chỉ 300KB
+    # File video thật 1-3 phút > 5MB
     if output_path.exists() and output_path.stat().st_size >= 5_000_000 and not force:
         return output_path
 
     print(f"[+] Đang dùng yt-dlp tìm kiếm và tải video nền Minecraft Parkour thật (Từ khóa: '{query}')...")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Dọn sạch các file tạm temp_mc_bg* trước khi tải để tránh nhặt nhầm file cũ
     for old_temp in output_path.parent.glob("temp_mc_bg*"):
         try:
             old_temp.unlink()
@@ -136,7 +136,6 @@ def download_minecraft_background(
             pass
 
     temp_template = str(output_path.parent / "temp_mc_bg.%(ext)s")
-
     search_query = f"ytsearch10:{query}"
     ydl_opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -150,7 +149,6 @@ def download_minecraft_background(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info(search_query, download=False)
             entries = res.get("entries", []) or []
-            # Ưu tiên độ dài chuẩn 1-3 phút (60s - 240s)
             for entry in entries:
                 if not entry:
                     continue
@@ -223,7 +221,13 @@ def build_threads_html(
 
     p_elements = []
     for idx, line in enumerate(lines):
-        norm_line = normalize_vietnamese_text(line)
+        if isinstance(line, dict):
+            line_str = line.get("text", "")
+        elif hasattr(line, "text"):
+            line_str = line.text
+        else:
+            line_str = str(line)
+        norm_line = normalize_vietnamese_text(line_str)
         escaped_line = html.escape(norm_line)
         opacity = "1" if idx < visible_count else "0"
         p_elements.append(f'<p style="opacity: {opacity};">{escaped_line}</p>')
@@ -328,6 +332,22 @@ def clip_with_audio(video_clip, audio_clip):
     return video_clip.with_audio(audio_clip) if MOVIEPY_V2 else video_clip.set_audio(audio_clip)
 
 
+def clip_set_volume(clip, factor: float):
+    if hasattr(clip, "with_volume_scaled"):
+        return clip.with_volume_scaled(factor)
+    elif hasattr(clip, "volumex"):
+        return clip.volumex(factor)
+    return clip
+
+
+def clip_resize_width(clip, width: int):
+    if hasattr(clip, "resized"):
+        return clip.resized(width=width)
+    elif hasattr(clip, "resize"):
+        return clip.resize(width=width)
+    return clip
+
+
 def crop_to_9_16(clip, target_w=1080, target_h=1920):
     w, h = clip.size
     target_ratio = target_w / target_h
@@ -344,14 +364,19 @@ def crop_to_9_16(clip, target_w=1080, target_h=1920):
     return clip.resized((target_w, target_h)) if MOVIEPY_V2 else clip.resize((target_w, target_h))
 
 
-async def generate_tts(text: str, output_path: Path, max_retries: int = 5):
-    voices = [CONFIG["voice"], "vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]
+async def generate_tts(text: str, output_path: Path, max_retries: int = 5, voice: Optional[str] = None):
+    primary_voice = voice or CONFIG["voice"]
+    voices = [primary_voice]
+    for v in ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]:
+        if v not in voices:
+            voices.append(v)
+
     norm_text = normalize_vietnamese_text(text)
     last_error = None
     for attempt in range(max_retries):
-        voice = voices[attempt % len(voices)]
+        chosen_voice = voices[attempt % len(voices)]
         try:
-            communicate = edge_tts.Communicate(text=norm_text, voice=voice, rate=CONFIG["voice_rate"])
+            communicate = edge_tts.Communicate(text=norm_text, voice=chosen_voice, rate=CONFIG["voice_rate"])
             await communicate.save(str(output_path))
             if output_path.exists() and output_path.stat().st_size > 0:
                 return
@@ -393,16 +418,33 @@ async def prepare_media_assets(story_data: dict, temp_dir: Path):
         wm_path = temp_dir / "watermark.png"
         await page.locator("#wm").screenshot(path=str(wm_path), omit_background=True)
 
-        for card in story_data.get("cards", []):
-            card_id = card["card_id"]
-            card_lines = card.get("lines", [])
+        cards = story_data.get("cards", [])
+        for card_idx, card in enumerate(cards):
+            card_id = card.get("card_id", card_idx + 1) if isinstance(card, dict) else getattr(card, "card_id", card_idx + 1)
+            time_ago = card.get("time_ago", "1 giờ") if isinstance(card, dict) else getattr(card, "time_ago", "1 giờ")
+            likes = card.get("likes", "10K") if isinstance(card, dict) else getattr(card, "likes", "10K")
+            replies = card.get("replies", "200") if isinstance(card, dict) else getattr(card, "replies", "200")
+            card_lines = card.get("lines", []) if isinstance(card, dict) else getattr(card, "lines", [])
 
-            for idx, line in enumerate(card_lines):
+            for idx, line_obj in enumerate(card_lines):
                 step_name = f"c{card_id}_s{idx + 1}"
 
+                if isinstance(line_obj, dict):
+                    line_text = line_obj.get("text", "")
+                    line_voice = line_obj.get("voice", CONFIG["voice"])
+                    line_sfx = line_obj.get("sfx_after", "none")
+                elif hasattr(line_obj, "text"):
+                    line_text = line_obj.text
+                    line_voice = getattr(line_obj, "voice", CONFIG["voice"])
+                    line_sfx = getattr(line_obj, "sfx_after", "none")
+                else:
+                    line_text = str(line_obj)
+                    line_voice = CONFIG["voice"]
+                    line_sfx = "none"
+
                 audio_path = temp_dir / f"{step_name}.mp3"
-                await generate_tts(line, audio_path)
-                await asyncio.sleep(0.5)
+                await generate_tts(line_text, audio_path, voice=line_voice)
+                await asyncio.sleep(0.3)
                 trim_audio_silence(audio_path)
 
                 # Chống giật khung: Luôn truyền TOÀN BỘ các câu của Card đó vào HTML
@@ -410,26 +452,39 @@ async def prepare_media_assets(story_data: dict, temp_dir: Path):
                 html_content = build_threads_html(
                     username=CONFIG["username"],
                     avatar_url=CONFIG["avatar_url"],
-                    time_ago=card["time_ago"],
+                    time_ago=time_ago,
                     lines=card_lines,
-                    likes=card["likes"],
-                    replies=card["replies"],
+                    likes=likes,
+                    replies=replies,
                     visible_count=idx + 1,
                 )
                 await page.set_content(html_content, wait_until="networkidle")
                 img_path = temp_dir / f"{step_name}.png"
                 await page.locator("#card").screenshot(path=str(img_path), omit_background=True)
 
-                segments.append({"image": img_path, "audio": audio_path})
+                is_final_line = (card_idx == len(cards) - 1) and (idx == len(card_lines) - 1)
+
+                segments.append({
+                    "image": img_path,
+                    "audio": audio_path,
+                    "sfx_after": line_sfx,
+                    "is_final_line": is_final_line,
+                })
 
         await browser.close()
     return segments, wm_path
 
 
-def build_final_video(segments: list, wm_path: Path, output_file: str = "output_short.mp4"):
-    # Đảm bảo video nền Minecraft thật và SFX thật luôn sẵn sàng trước khi dựng video
+def build_final_video(
+    segments: list,
+    wm_path: Path,
+    output_file: str = "output_short.mp4",
+    use_video_meme_outro: bool = True
+):
+    # Đảm bảo video nền Minecraft thật, SFX thật và kho meme luôn sẵn sàng
     download_minecraft_background()
     ensure_real_sfx()
+    harvest_all()
 
     bg_path = Path("assets/background.mp4")
     if not bg_path.exists():
@@ -444,7 +499,7 @@ def build_final_video(segments: list, wm_path: Path, output_file: str = "output_
 
     for seg in segments:
         voice_clip = AudioFileClip(str(seg["audio"]))
-        step_duration = voice_clip.duration
+        voice_duration = voice_clip.duration
 
         voice_clip = clip_set_start(voice_clip, current_time)
         audio_clips.append(voice_clip)
@@ -456,6 +511,39 @@ def build_final_video(segments: list, wm_path: Path, output_file: str = "output_
             except Exception as e:
                 print(f"[!] Bỏ qua pop sfx do lỗi: {e}")
 
+        # Mid-SFX: Nếu câu có sfx_after != 'none', chèn ngay sau câu đọc và nghỉ 0.4s-0.6s
+        sfx_after = seg.get("sfx_after", "none")
+        sfx_extra_duration = 0.0
+
+        if sfx_after and sfx_after != "none":
+            candidate_paths = [
+                Path(f"assets/sfx/{sfx_after}.mp3"),
+                Path(f"assets/sfx/{sfx_after}.wav"),
+                Path(f"assets/{sfx_after}.mp3"),
+            ]
+            sfx_file = None
+            for cp in candidate_paths:
+                if cp.exists():
+                    sfx_file = cp
+                    break
+
+            if sfx_file:
+                try:
+                    sfx_clip = AudioFileClip(str(sfx_file))
+                    # Giới hạn thời lượng phát SFX tối đa 2.2s và subclip để âm thanh ngắt dứt khoát trước câu sau
+                    sfx_play_duration = min(sfx_clip.duration, 2.2)
+                    sfx_clip = clip_subclip(sfx_clip, 0, sfx_play_duration)
+                    sfx_start = current_time + voice_duration
+                    sfx_clip = clip_set_start(sfx_clip, sfx_start)
+                    audio_clips.append(sfx_clip)
+                    # Độ trễ nghỉ 0.5s (trong khoảng 0.4s-0.6s) để người xem kịp nghe và cười với tiếng meme
+                    pause_delay = 0.5
+                    sfx_extra_duration = sfx_play_duration + pause_delay
+                except Exception as e:
+                    print(f"[!] Bỏ qua sfx {sfx_after} do lỗi: {e}")
+
+        step_duration = voice_duration + sfx_extra_duration
+
         img_clip = ImageClip(str(seg["image"]))
         img_clip = clip_set_start(img_clip, current_time)
         img_clip = clip_set_duration(img_clip, step_duration)
@@ -464,7 +552,8 @@ def build_final_video(segments: list, wm_path: Path, output_file: str = "output_
 
         current_time += step_duration
 
-    if final_sfx_path.exists() and visual_clips:
+    # Fallback final_sfx nếu câu cuối cùng không có Mid-SFX VÀ không có video meme outro
+    if visual_clips and (not segments or segments[-1].get("sfx_after", "none") == "none") and not use_video_meme_outro and final_sfx_path.exists():
         try:
             sfx_clip = AudioFileClip(str(final_sfx_path))
             sfx_clip = clip_set_start(sfx_clip, max(0, current_time - 0.15))
@@ -475,7 +564,87 @@ def build_final_video(segments: list, wm_path: Path, output_file: str = "output_
         except Exception as e:
             print(f"[!] Bỏ qua final sfx do lỗi: {e}")
 
+    # Video Meme Reaction cuối bài
+    meme_clips_to_close = []
+    if use_video_meme_outro:
+        vm_dir = Path("assets/video_memes")
+        vm_candidates = sorted(list(vm_dir.glob("*.mp4")) + list(vm_dir.glob("*.webm")))
+        if vm_candidates:
+            chosen_meme = random.choice(vm_candidates)
+            print(f"[+] Chèn Video Meme reaction cuối bài: {chosen_meme.name}")
+            try:
+                meme_clip = VideoFileClip(str(chosen_meme))
+                # Resize về chiều rộng 750px
+                meme_clip = clip_resize_width(meme_clip, 750)
+
+                # Giới hạn chiều cao meme tối đa 440px (chuẩn 16:9 ở width 750 là 422px) để không che khuất card
+                if meme_clip.size[1] > 440:
+                    target_h = int(750 * 9 / 16)
+                    y_crop = (meme_clip.size[1] - target_h) // 2
+                    meme_clip = meme_clip.cropped(y1=y_crop, y2=y_crop + target_h) if MOVIEPY_V2 else meme_clip.crop(y1=y_crop, y2=y_crop + target_h)
+
+                meme_start = current_time
+                meme_duration = meme_clip.duration
+
+                meme_clip = clip_set_start(meme_clip, meme_start)
+
+                # Đặt ở nửa dưới màn hình bên dưới khung Threads (tính theo card_bottom thực tế)
+                card_h = visual_clips[-1].size[1] if visual_clips else 700
+                card_bottom = (CONFIG["video_height"] + card_h) / 2
+                meme_h = meme_clip.size[1]
+
+                # Đặt cách cạnh dưới card 25px, đảm bảo luôn nằm dưới card và không vượt mép dưới màn hình (1920)
+                pos_y = int(card_bottom + 25)
+                if pos_y + meme_h > 1880:
+                    pos_y = max(int(card_bottom + 10), 1880 - meme_h)
+
+                meme_clip = clip_set_position(meme_clip, ("center", pos_y))
+
+                # Nối thêm thời lượng của clip meme vào khung Threads Card 2 bên trên
+                if visual_clips:
+                    visual_clips[-1] = clip_set_duration(visual_clips[-1], visual_clips[-1].duration + meme_duration)
+
+                visual_clips.append(meme_clip)
+                meme_clips_to_close.append(meme_clip)
+
+                # Nối âm thanh của clip meme
+                if meme_clip.audio:
+                    meme_audio = clip_set_start(meme_clip.audio, meme_start)
+                    audio_clips.append(meme_audio)
+
+                current_time += meme_duration
+            except Exception as e:
+                print(f"[!] Bỏ qua video meme reaction do lỗi: {e}")
+
     total_duration = current_time
+
+    # Nhạc nền BGM: chọn ngẫu nhiên, hạ âm lượng xuống 12% và phát xuyên suốt video
+    bgm_clips_to_close = []
+    bgm_dir = Path("assets/bgm")
+    bgm_candidates = sorted(list(bgm_dir.glob("*.mp3")) + list(bgm_dir.glob("*.wav")))
+    if bgm_candidates:
+        chosen_bgm = random.choice(bgm_candidates)
+        print(f"[+] Lồng BGM ngẫu nhiên: {chosen_bgm.name} (Âm lượng 12%)")
+        try:
+            bgm_clip = AudioFileClip(str(chosen_bgm))
+            if bgm_clip.duration < total_duration:
+                repeats = int(total_duration // bgm_clip.duration) + 1
+                try:
+                    from moviepy import concatenate_audioclips
+                except ImportError:
+                    from moviepy.editor import concatenate_audioclips
+                bgm_clip = concatenate_audioclips([bgm_clip] * repeats)
+
+            bgm_clip = clip_subclip(bgm_clip, 0, total_duration)
+            bgm_clip = clip_set_start(bgm_clip, 0)
+            bgm_clip = clip_set_duration(bgm_clip, total_duration)
+            # Giảm âm lượng xuống 12%
+            bgm_clip = clip_set_volume(bgm_clip, 0.12)
+            audio_clips.insert(0, bgm_clip)
+            bgm_clips_to_close.append(bgm_clip)
+        except Exception as e:
+            print(f"[!] Lỗi khi lồng BGM {chosen_bgm.name}: {e}")
+
     bg_video = VideoFileClip(str(bg_path))
 
     # Nếu video nền ngắn hơn độ dài kịch bản, lặp lại video để tránh khung hình đen
@@ -514,31 +683,19 @@ def build_final_video(segments: list, wm_path: Path, output_file: str = "output_
         )
         print(f"[✓] Đã xuất file: {output_file}")
     finally:
-        try:
-            bg_video.close()
-        except Exception:
-            pass
-        try:
-            final_video.close()
-        except Exception:
-            pass
-        try:
-            final_audio.close()
-        except Exception:
-            pass
-        for vc in visual_clips:
+        for c in [bg_video, final_video, final_audio] + visual_clips + audio_clips + meme_clips_to_close + bgm_clips_to_close:
             try:
-                vc.close()
-            except Exception:
-                pass
-        for ac in audio_clips:
-            try:
-                ac.close()
+                c.close()
             except Exception:
                 pass
 
 
-async def render_story_video(story_data: dict, output_file: str = "output_short.mp4", temp_dir: Path = None) -> str:
+async def render_story_video(
+    story_data: dict,
+    output_file: str = "output_short.mp4",
+    temp_dir: Path = None,
+    use_video_meme_outro: Optional[bool] = None,
+) -> str:
     cleanup_temp = False
     if temp_dir is None:
         temp_dir = Path(f"temp_build_{random.randint(1000, 9999)}")
@@ -547,7 +704,8 @@ async def render_story_video(story_data: dict, output_file: str = "output_short.
     temp_dir.mkdir(parents=True, exist_ok=True)
     try:
         segments, wm_path = await prepare_media_assets(story_data, temp_dir)
-        build_final_video(segments, wm_path, output_file=output_file)
+        meme_outro = use_video_meme_outro if use_video_meme_outro is not None else story_data.get("use_video_meme_outro", True)
+        build_final_video(segments, wm_path, output_file=output_file, use_video_meme_outro=meme_outro)
         return output_file
     finally:
         if cleanup_temp and temp_dir.exists():
@@ -558,6 +716,7 @@ SAMPLE_STORIES = [
     {
         "humor_score": 10,
         "title": "Tiểu Minh và bài văn tả người hùng",
+        "use_video_meme_outro": True,
         "cards": [
             {
                 "card_id": 1,
@@ -565,10 +724,22 @@ SAMPLE_STORIES = [
                 "likes": "18,4K",
                 "replies": "412",
                 "lines": [
-                    "Trong giờ tập làm văn, cô giáo yêu cầu cả lớp viết về một người hùng thầm lặng trong gia đình.",
-                    "Tiểu Minh hào hứng viết liền hai trang giấy mà không cần dừng lại suy nghĩ một giây nào.",
-                    "Cô giáo đọc bài văn thấy rưng rưng nước mắt vì sự hi sinh cao cả của người bố."
-                ]
+                    StoryLine(
+                        text="Trong giờ tập làm văn, cô giáo yêu cầu cả lớp viết về một người hùng thầm lặng trong gia đình.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="Tiểu Minh hào hứng viết liền hai trang giấy mà không cần dừng lại suy nghĩ một giây nào.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="Cô giáo đọc bài văn thấy rưng rưng nước mắt vì sự hi sinh cao cả của người bố.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="wow",
+                    ),
+                ],
             },
             {
                 "card_id": 2,
@@ -576,16 +747,29 @@ SAMPLE_STORIES = [
                 "likes": "18,4K",
                 "replies": "412",
                 "lines": [
-                    "Đến cuối bài, cô xúc động hỏi: 'Bố em làm công việc nguy hiểm đến thế này thật sao?'",
-                    "Tiểu Minh ngây thơ đáp: 'Dạ không cô ơi, em tả lại cảnh bố em đi rửa bát đấy ạ!'",
-                    "'Chỉ cần lỡ tay làm vỡ một cái đĩa là mẹ em cho bay màu ngay lập tức!'"
-                ]
-            }
-        ]
+                    StoryLine(
+                        text="Đến cuối bài, cô xúc động hỏi: 'Bố em làm công việc nguy hiểm đến thế này thật sao?'",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="huh",
+                    ),
+                    StoryLine(
+                        text="Tiểu Minh ngây thơ đáp: 'Dạ không cô ơi, em tả lại cảnh bố em đi rửa bát đấy ạ!'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="cai_gi_do",
+                    ),
+                    StoryLine(
+                        text="'Chỉ cần lỡ tay làm vỡ một cái đĩa là mẹ em cho bay màu ngay lập tức!'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="vine_boom",
+                    ),
+                ],
+            },
+        ],
     },
     {
         "humor_score": 10,
         "title": "Ai đã lấy cắp nỏ thần của An Dương Vương",
+        "use_video_meme_outro": True,
         "cards": [
             {
                 "card_id": 1,
@@ -593,10 +777,22 @@ SAMPLE_STORIES = [
                 "likes": "24,8K",
                 "replies": "652",
                 "lines": [
-                    "Trong giờ kiểm tra miệng môn Lịch sử, thầy giáo nghiêm giọng gọi Tiểu Minh đứng lên bảng.",
-                    "Thầy chỉ tay hỏi: 'Em hãy cho thầy biết, ai là người đã lấy cắp nỏ thần của An Dương Vương?'",
-                    "Tiểu Minh hoảng hốt, mặt mũi tái mét vội vàng chắp tay thề thốt trước cả lớp."
-                ]
+                    StoryLine(
+                        text="Trong giờ kiểm tra miệng môn Lịch sử, thầy giáo nghiêm giọng gọi Tiểu Minh đứng lên bảng.",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="Thầy chỉ tay hỏi: 'Em hãy cho thầy biết, ai là người đã lấy cắp nỏ thần của An Dương Vương?'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="huh",
+                    ),
+                    StoryLine(
+                        text="Tiểu Minh hoảng hốt, mặt mũi tái mét vội vàng chắp tay thề thốt trước cả lớp.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                ],
             },
             {
                 "card_id": 2,
@@ -604,16 +800,29 @@ SAMPLE_STORIES = [
                 "likes": "24,8K",
                 "replies": "652",
                 "lines": [
-                    "Cậu mếu máo nói: 'Thưa thầy, em thề danh dự là cả dòng họ nhà em không ai lấy cắp nỏ thần đâu ạ!'",
-                    "Thầy giáo bực mình gọi điện thoại ngay cho phụ huynh để phàn nàn về thái độ của con trai.",
-                    "Đầu dây bên kia, bố Tiểu Minh thở dài: 'Thôi thầy xem cái nỏ đó bao nhiêu tiền để tôi chuyển khoản đền cái khác!'"
-                ]
-            }
-        ]
+                    StoryLine(
+                        text="Cậu mếu máo nói: 'Thưa thầy, em thề danh dự là cả dòng họ nhà em không ai lấy cắp nỏ thần đâu ạ!'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="laugh",
+                    ),
+                    StoryLine(
+                        text="Thầy giáo bực mình gọi điện thoại ngay cho phụ huynh để phàn nàn về thái độ của con trai.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="cai_gi_do",
+                    ),
+                    StoryLine(
+                        text="Đầu dây bên kia, bố Tiểu Minh thở dài: 'Thôi thầy xem cái nỏ đó bao nhiêu tiền để tôi chuyển khoản đền cái khác!'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="vine_boom",
+                    ),
+                ],
+            },
+        ],
     },
     {
         "humor_score": 9,
         "title": "Bài kiểm tra Toán đạt điểm mười",
+        "use_video_meme_outro": True,
         "cards": [
             {
                 "card_id": 1,
@@ -621,10 +830,22 @@ SAMPLE_STORIES = [
                 "likes": "31,5K",
                 "replies": "890",
                 "lines": [
-                    "Vừa đi học về, Tiểu Minh đã hớn hở chạy ngay vào phòng khách khoe bài kiểm tra môn Toán.",
-                    "Bố nhìn thấy con trai đạt điểm mười tuyệt đối thì mừng rỡ rút ngay tờ năm trăm nghìn đồng ra thưởng nóng.",
-                    "Bố tự hào vỗ ngực: 'Gen thông minh của bố đúng là đỉnh cao, không lẫn đi đâu được!'"
-                ]
+                    StoryLine(
+                        text="Vừa đi học về, Tiểu Minh đã hớn hở chạy ngay vào phòng khách khoe bài kiểm tra môn Toán.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="Bố nhìn thấy con trai đạt điểm mười tuyệt đối thì mừng rỡ rút ngay tờ năm trăm nghìn đồng ra thưởng nóng.",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="wow",
+                    ),
+                    StoryLine(
+                        text="Bố tự hào vỗ ngực: 'Gen thông minh của bố đúng là đỉnh cao, không lẫn đi đâu được!'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="none",
+                    ),
+                ],
             },
             {
                 "card_id": 2,
@@ -632,16 +853,29 @@ SAMPLE_STORIES = [
                 "likes": "31,5K",
                 "replies": "890",
                 "lines": [
-                    "Cầm tiền trong tay, Tiểu Minh ghé sát tai bố rồi thỏ thẻ hỏi một câu vô cùng chân thành.",
-                    "'Bố ơi, thế bố có muốn chia cho bạn lớp trưởng ngồi cạnh con một nửa số tiền này không?'",
-                    "Đúng lúc đó, mẹ từ trong bếp bước ra với chiếc chổi lông gà trên tay."
-                ]
-            }
-        ]
+                    StoryLine(
+                        text="Cầm tiền trong tay, Tiểu Minh ghé sát tai bố rồi thỏ thẻ hỏi một câu vô cùng chân thành.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="'Bố ơi, thế bố có muốn chia cho bạn lớp trưởng ngồi cạnh con một nửa số tiền này không?'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="huh",
+                    ),
+                    StoryLine(
+                        text="Đúng lúc đó, mẹ từ trong bếp bước ra với chiếc chổi lông gà trên tay.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="vine_boom",
+                    ),
+                ],
+            },
+        ],
     },
     {
         "humor_score": 9,
         "title": "Bát canh xương hầm tẩm bổ",
+        "use_video_meme_outro": True,
         "cards": [
             {
                 "card_id": 1,
@@ -649,10 +883,22 @@ SAMPLE_STORIES = [
                 "likes": "15,2K",
                 "replies": "328",
                 "lines": [
-                    "Dạo gần đây mẹ hay than phiền bị đau lưng nên bố quyết định đích thân trổ tài nấu ăn tẩm bổ.",
-                    "Bố cặm cụi dưới bếp suốt bốn tiếng đồng hồ để ninh một nồi canh xương hầm thơm phức.",
-                    "Mẹ đi làm về thấy bàn ăn thịnh soạn thì cảm động suýt khóc vì sự chu đáo của chồng."
-                ]
+                    StoryLine(
+                        text="Dạo gần đây mẹ hay than phiền bị đau lưng nên bố quyết định đích thân trổ tài nấu ăn tẩm bổ.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="Bố cặm cụi dưới bếp suốt bốn tiếng đồng hồ để ninh một nồi canh xương hầm thơm phức.",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="wow",
+                    ),
+                    StoryLine(
+                        text="Mẹ đi làm về thấy bàn ăn thịnh soạn thì cảm động suýt khóc vì sự chu đáo của chồng.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                ],
             },
             {
                 "card_id": 2,
@@ -660,16 +906,29 @@ SAMPLE_STORIES = [
                 "likes": "15,2K",
                 "replies": "328",
                 "lines": [
-                    "Ăn xong bát canh, mẹ ân cần hỏi: 'Hôm nay trời bão hay sao mà bố nó tự dưng đảm đang thế?'",
-                    "Bố gãi đầu cười trừ: 'À thì chiều nay bố lỡ tay làm rơi vỡ bộ ấm chén Bát Tràng của ông ngoại...'",
-                    "'Nên bố nấu nồi canh xương này để mẹ có thêm canxi mà giữ bình tĩnh đấy!'"
-                ]
-            }
-        ]
+                    StoryLine(
+                        text="Ăn xong bát canh, mẹ ân cần hỏi: 'Hôm nay trời bão hay sao mà bố nó tự dưng đảm đang thế?'",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="huh",
+                    ),
+                    StoryLine(
+                        text="Bố gãi đầu cười trừ: 'À thì chiều nay bố lỡ tay làm rơi vỡ bộ ấm chén Bát Tràng của ông ngoại...'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="cai_gi_do",
+                    ),
+                    StoryLine(
+                        text="'Nên bố nấu nồi canh xương này để mẹ có thêm canxi mà giữ bình tĩnh đấy!'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="vine_boom",
+                    ),
+                ],
+            },
+        ],
     },
     {
         "humor_score": 10,
         "title": "Đi chợ mua cá tươi giúp mẹ",
+        "use_video_meme_outro": True,
         "cards": [
             {
                 "card_id": 1,
@@ -677,10 +936,22 @@ SAMPLE_STORIES = [
                 "likes": "42,1K",
                 "replies": "1.230",
                 "lines": [
-                    "Mẹ đang bận nấu cơm nên đưa tiền nhờ con trai ra chợ mua một con cá chép thật tươi.",
-                    "Mẹ dặn dò rất kỹ: 'Nhớ chọn con nào quẫy thật khỏe, mang đỏ tươi và mắt trong veo nhé!'",
-                    "Hai tiếng trôi qua, con trai mới hớt hải ôm túi cá chạy về với nụ cười rạng rỡ trên môi."
-                ]
+                    StoryLine(
+                        text="Mẹ đang bận nấu cơm nên đưa tiền nhờ con trai ra chợ mua một con cá chép thật tươi.",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="Mẹ dặn dò rất kỹ: 'Nhớ chọn con nào quẫy thật khỏe, mang đỏ tươi và mắt trong veo nhé!'",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="none",
+                    ),
+                    StoryLine(
+                        text="Hai tiếng trôi qua, con trai mới hớt hải ôm túi cá chạy về với nụ cười rạng rỡ trên môi.",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="wow",
+                    ),
+                ],
             },
             {
                 "card_id": 2,
@@ -688,23 +959,37 @@ SAMPLE_STORIES = [
                 "likes": "42,1K",
                 "replies": "1.230",
                 "lines": [
-                    "Mẹ mở túi ra kiểm tra thì thấy con cá đã nằm im bất động từ bao giờ.",
-                    "Mẹ tức giận quát: 'Mẹ dặn mua cá đang quẫy khỏe, sao giờ đơ ra như khúc gỗ thế này?'",
-                    "Con trai tự hào giải thích: 'Tại trên đường về con sợ nó mệt, nên con đã bế nó đi bộ về đấy mẹ!'"
-                ]
-            }
-        ]
-    }
+                    StoryLine(
+                        text="Mẹ mở túi ra kiểm tra thì thấy con cá đã nằm im bất động từ bao giờ.",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="cai_gi_do",
+                    ),
+                    StoryLine(
+                        text="Mẹ tức giận quát: 'Mẹ dặn mua cá đang quẫy khỏe, sao giờ đơ ra như khúc gỗ thế này?'",
+                        voice="vi-VN-HoaiMyNeural",
+                        sfx_after="huh",
+                    ),
+                    StoryLine(
+                        text="Con trai tự hào giải thích: 'Tại trên đường về con sợ nó mệt, nên con đã bế nó đi bộ về đấy mẹ!'",
+                        voice="vi-VN-NamMinhNeural",
+                        sfx_after="vine_boom",
+                    ),
+                ],
+            },
+        ],
+    },
 ]
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Threads Shorts Video Builder")
+    parser = argparse.ArgumentParser(description="Threads Shorts Video Builder with BGM, Mid-SFX, and Meme Reactions")
     parser.add_argument("--count", type=int, default=1, help="Số lượng video cần tạo (mặc định: 1)")
     parser.add_argument("--urls", nargs="+", default=TARGET_THREADS_URLS, help="Danh sách URL Threads cần quét")
     parser.add_argument("--watermark", default=CONFIG["channel_watermark"], help="Watermark kênh")
-    parser.add_argument("--voice", default=CONFIG["voice"], help="Giọng đọc edge-tts")
+    parser.add_argument("--voice", default=CONFIG["voice"], help="Giọng đọc edge-tts mặc định")
+    parser.add_argument("--output", default="output_short.mp4", help="Đường dẫn file video đầu ra (mặc định: output_short.mp4)")
     parser.add_argument("--mock", action="store_true", help="Dùng kịch bản mẫu (không cần API key)")
+    parser.add_argument("--no-meme", action="store_true", help="Không chèn video meme reaction cuối bài")
     args = parser.parse_args()
 
     CONFIG["channel_watermark"] = args.watermark
@@ -733,8 +1018,9 @@ async def main():
             story_data = SAMPLE_STORIES[(i - 1) % len(SAMPLE_STORIES)]
             print(f"[✓] Đã chọn kịch bản từ kho: '{story_data.get('title', 'Kịch bản viral')}' (Điểm hài hước: {story_data.get('humor_score', 10)}/10)")
 
-        out_name = f"output_short_batch_{i}.mp4" if total_videos > 1 else "output_short.mp4"
-        await render_story_video(story_data, output_file=out_name)
+        out_name = f"output_short_batch_{i}.mp4" if total_videos > 1 else args.output
+        use_meme = not args.no_meme
+        await render_story_video(story_data, output_file=out_name, use_video_meme_outro=use_meme)
 
     print(f"\n🎉 HOÀN TẤT! Đã xuất xong {total_videos} video.")
 
