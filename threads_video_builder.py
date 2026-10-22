@@ -37,9 +37,9 @@ except ImportError:
     MOVIEPY_V2 = False
 
 CONFIG = {
-    "channel_watermark": "hamster kể chuyện",
-    "username": "tieuminh.page",
-    "avatar_url": "https://api.dicebear.com/9.x/adventurer/svg?seed=Felix",
+    "channel_watermark": "chuyện vui trên thờ rét",
+    "username": "chuyenvuithoret",
+    "avatar_url": "https://api.dicebear.com/9.x/shapes/svg?seed=chuyenvuithoret",
     "voice": "vi-VN-HoaiMyNeural",
     "voice_rate": "+18%",
     "video_width": 1080,

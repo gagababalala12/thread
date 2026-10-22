@@ -528,6 +528,57 @@ async def safe_add_cookies(context, cookies: list) -> int:
         print(f"[✓] Đã nạp an toàn {success}/{len(cookies)} cookies vào context.")
         return success
 
+async def dismiss_tiktok_modals(page):
+    """Đóng các pop-up, modal hướng dẫn hoặc overlay của TikTok Studio nếu xuất hiện."""
+    try:
+        res = page.keyboard.press("Escape")
+        if asyncio.iscoroutine(res):
+            await res
+    except Exception:
+        pass
+
+    modal_selectors = [
+        'button:has-text("Đã hiểu")',
+        'button:has-text("Got it")',
+        'button:has-text("Bỏ qua")',
+        'button:has-text("Skip")',
+        'button:has-text("Đóng")',
+        'button:has-text("Close")',
+        'button[aria-label="Close"]',
+        'button[aria-label="Đóng"]',
+        '.TUXModal-close',
+        '.common-modal-close',
+        '[data-tid="modal-close-btn"]',
+    ]
+    for sel in modal_selectors:
+        try:
+            btns = page.locator(sel)
+            cnt = btns.count()
+            if asyncio.iscoroutine(cnt):
+                cnt = await cnt
+            if isinstance(cnt, int) and cnt > 0:
+                for i in range(min(cnt, 3)):
+                    btn = btns.nth(i) if hasattr(btns, "nth") else btns
+                    vis = btn.is_visible() if hasattr(btn, "is_visible") else True
+                    if asyncio.iscoroutine(vis):
+                        vis = await vis
+                    if vis:
+                        cl = btn.click(force=True, timeout=1000)
+                        if asyncio.iscoroutine(cl):
+                            await cl
+                        await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+    try:
+        overlays = page.locator('.TUXModal-overlay, .modal-mask, .common-modal-mask')
+        if hasattr(overlays, "evaluate_all"):
+            rem = overlays.evaluate_all('els => els.forEach(el => el.remove())')
+            if asyncio.iscoroutine(rem):
+                await rem
+    except Exception:
+        pass
+
 # ==========================================
 # 3. TỰ ĐỘNG ĐĂNG BÀI ĐA NỀN TẢNG (PLAYWRIGHT)
 # ==========================================
@@ -548,7 +599,10 @@ async def upload_to_tiktok(page, video_path: Path, caption: str) -> str:
         except Exception:
             for frame in page.frames:
                 f_input = frame.locator('input[type="file"]').first
-                if await f_input.count() > 0:
+                cnt = f_input.count()
+                if asyncio.iscoroutine(cnt):
+                    cnt = await cnt
+                if cnt > 0:
                     file_input = f_input
                     break
 
@@ -557,25 +611,70 @@ async def upload_to_tiktok(page, video_path: Path, caption: str) -> str:
         await asyncio.sleep(12)
 
         # Điền caption
+        await dismiss_tiktok_modals(page)
         caption_box = page.locator('div[contenteditable="true"], textarea').first
-        if await caption_box.count() > 0:
-            await caption_box.click()
+        cap_count = caption_box.count()
+        if asyncio.iscoroutine(cap_count):
+            cap_count = await cap_count
+        if cap_count > 0:
+            try:
+                cl = caption_box.click(force=True, timeout=5000)
+                if asyncio.iscoroutine(cl):
+                    await cl
+            except Exception:
+                try:
+                    foc = caption_box.evaluate('el => el.focus()')
+                    if asyncio.iscoroutine(foc):
+                        await foc
+                except Exception:
+                    pass
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Backspace")
             await page.keyboard.type(caption, delay=20)
+            print("[TikTok] Đã nhập caption thành công.")
 
         await asyncio.sleep(3)
         # Chờ nút Đăng (Post) sẵn sàng
         post_btn = page.locator('button:has-text("Đăng"), button:has-text("Post")').last
-        for _ in range(15):
-            if await post_btn.count() > 0 and await post_btn.is_enabled():
-                break
+        post_ready = False
+        for i in range(25):
+            await dismiss_tiktok_modals(page)
+            p_cnt = post_btn.count()
+            if asyncio.iscoroutine(p_cnt):
+                p_cnt = await p_cnt
+            if p_cnt > 0:
+                try:
+                    en = post_btn.is_enabled()
+                    if asyncio.iscoroutine(en):
+                        en = await en
+                except Exception:
+                    en = True
+                if en:
+                    post_ready = True
+                    break
             await asyncio.sleep(2)
+            if (i + 1) % 5 == 0:
+                print(f"[TikTok] Đang đợi upload hoàn tất và nút Đăng sẵn sàng... ({(i + 1) * 2}s)")
 
-        if await post_btn.count() > 0:
-            await post_btn.click()
+        p_cnt_final = post_btn.count()
+        if asyncio.iscoroutine(p_cnt_final):
+            p_cnt_final = await p_cnt_final
+
+        if post_ready or p_cnt_final > 0:
+            try:
+                cl = post_btn.click(force=True, timeout=5000)
+                if asyncio.iscoroutine(cl):
+                    await cl
+            except Exception:
+                try:
+                    eval_cl = post_btn.evaluate('el => el.click()')
+                    if asyncio.iscoroutine(eval_cl):
+                        await eval_cl
+                except Exception:
+                    pass
             print("[TikTok] Đã bấm nút Đăng video!")
             await asyncio.sleep(8)
+            await dismiss_tiktok_modals(page)
             return "✅ Đã đăng"
         else:
             return "❌ Lỗi (Không tìm thấy nút Đăng)"
