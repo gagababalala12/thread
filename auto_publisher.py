@@ -472,20 +472,104 @@ def start_dashboard_server(port=8080):
 # 4. VÒNG LẶP CHÍNH: 4 TIẾNG 1 VIDEO
 # ==========================================
 async def login_setup():
-    """Chạy 1 lần đầu để đăng nhập sẵn tài khoản vào browser_profile/"""
+    """Chạy 1 lần đầu để đăng nhập sẵn tài khoản vào browser_profile/
+    
+    Tự động nhận diện môi trường:
+    - Nếu có màn hình ($DISPLAY): Mở cửa sổ trình duyệt đồ họa trực tiếp.
+    - Nếu chạy trên máy chủ / WSL không có GUI: Tự động mở chế độ Remote Debugging (Port 9222).
+      Người dùng chỉ cần mở chrome://inspect trên máy của mình để thao tác trực quan.
+    """
+    import sys
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR.resolve()),
-            headless=False,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
-        page = await context.new_page()
+        context = None
+        # 1. Thử mở giao diện đồ họa nếu có DISPLAY
+        if has_display:
+            try:
+                print("[+] Đang khởi chạy trình duyệt giao diện đồ họa...")
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(PROFILE_DIR.resolve()),
+                    headless=False,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"]
+                )
+            except Exception as e:
+                print(f"[!] Không thể mở cửa sổ đồ họa ({e}). Chuyển sang chế độ Remote Login...")
+                context = None
+
+        # 2. Chế độ Remote Login (Port 9222) khi không có $DISPLAY
+        if context is None:
+            print("[+] Đang khởi chạy trình duyệt ở chế độ Remote Login (Port 9222)...")
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR.resolve()),
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--remote-debugging-port=9222",
+                    "--remote-debugging-address=0.0.0.0"
+                ]
+            )
+
+            page_tiktok = context.pages[0] if context.pages else await context.new_page()
+            try:
+                await page_tiktok.goto("https://www.tiktok.com/login", timeout=30000)
+            except Exception:
+                pass
+
+            page_yt = await context.new_page()
+            try:
+                await page_yt.goto("https://studio.youtube.com", timeout=30000)
+            except Exception:
+                pass
+
+            page_fb = await context.new_page()
+            try:
+                await page_fb.goto("https://www.facebook.com", timeout=30000)
+            except Exception:
+                pass
+
+            print("\n" + "=" * 65)
+            print("🌐 HƯỚNG DẪN ĐĂNG NHẬP (MÔI TRƯỜNG LINUX / WSL KHÔNG CÓ $DISPLAY)")
+            print("=" * 65)
+            print("Trình duyệt Chromium đã mở sẵn 3 trang đăng nhập qua cổng: 9222\n")
+            print("👉 Các bước thao tác trên máy của bạn (Chrome / Edge):")
+            print("   1. Mở một tab mới trên Chrome hoặc Edge: chrome://inspect (hoặc edge://inspect)")
+            print("   2. Bấm nút 'Configure...', thêm 'localhost:9222' rồi bấm 'Done'.")
+            print("   3. Tại mục 'Remote Target', bạn sẽ thấy 3 trang TikTok, YouTube Studio, Facebook.")
+            print("   4. Bấm 'inspect' để mở màn hình điều khiển trực tiếp (gõ tài khoản, mật khẩu, 2FA).")
+            print("=" * 65)
+            print("\n👉 Sau khi đăng nhập xong cả 3 trang:")
+            print("   Nhấn phím [ENTER] tại terminal này để lưu phiên đăng nhập và đóng trình duyệt: ", end="", flush=True)
+
+            await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+            await context.close()
+            print(f"\n[✓] Đã lưu thành công phiên đăng nhập vào: {PROFILE_DIR.resolve()}/")
+            return
+
+        # Nếu mở được giao diện đồ họa
+        page = context.pages[0] if context.pages else await context.new_page()
         await page.goto("https://www.tiktok.com/login")
-        print("👉 Hãy đăng nhập TikTok, YouTube Studio và Facebook trên cửa sổ trình duyệt vừa mở.")
-        print("👉 Sau khi đăng nhập xong cả 3 trang, hãy đóng cửa sổ trình duyệt lại.")
-        await page.wait_for_event("close", timeout=0)
+        page_yt = await context.new_page()
+        await page_yt.goto("https://studio.youtube.com")
+        page_fb = await context.new_page()
+        await page_fb.goto("https://www.facebook.com")
+
+        print("\n" + "=" * 65)
+        print("👉 Hãy đăng nhập TikTok, YouTube Studio và Facebook trên cửa sổ vừa mở.")
+        print("👉 Sau khi đăng nhập xong:")
+        print("   - Đóng cửa sổ trình duyệt lại, HOẶC")
+        print("   - Nhấn phím [ENTER] tại terminal này để hoàn tất.")
+        print("=" * 65)
+
+        close_task = asyncio.create_task(page.wait_for_event("close", timeout=0))
+        input_task = asyncio.create_task(asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline))
+        done, pending = await asyncio.wait([close_task, input_task], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
         await context.close()
+        print(f"\n[✓] Đã lưu thành công phiên đăng nhập vào: {PROFILE_DIR.resolve()}/")
 
 async def run_single_cycle(video_counter: int, dry_run: bool = False) -> dict:
     """Thực hiện đúng 1 chu kỳ: quét kịch bản, dựng video, và đăng bài (hoặc giả lập nếu dry_run)."""
