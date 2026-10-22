@@ -82,11 +82,14 @@ asyncio.run(main())
 ```
 
 ### 5. Tự động đăng đa nền tảng & Web Dashboard (Port 8080):
-Hệ thống hỗ trợ tự động đăng video lên 3 nền tảng: **YouTube Shorts**, **TikTok Studio**, và **Facebook Reels** theo chu kỳ 4 tiếng / video, đi kèm Web Dashboard trực quan:
+Hệ thống hỗ trợ tự động đăng video lên 3 nền tảng: **YouTube Shorts**, **TikTok Studio**, và **Facebook Reels** theo chu kỳ 4 tiếng / video, đi kèm Web Dashboard trực quan và cơ chế quản lý phiên/cookie 100% ổn định:
 
 ```bash
-# Bước 1: Đăng nhập sẵn tài khoản vào profile trình duyệt (chỉ cần chạy 1 lần đầu)
+# Bước 1: Đăng nhập & nạp phiên tài khoản (hỗ trợ cả WSL2 / Linux / Windows)
 python auto_publisher.py --login
+
+# Kiểm tra nhanh trạng thái xác thực của 3 nền tảng từ terminal:
+python auto_publisher.py --check-login
 
 # Bước 2: Khởi động vòng lặp tự động (4 tiếng / 1 video) & Dashboard theo dõi:
 python auto_publisher.py
@@ -98,10 +101,21 @@ python auto_publisher.py --dry-run --once
 python auto_publisher.py --server-only
 ```
 
-- **Web Dashboard**: Truy cập trực tiếp tại `http://localhost:8080` (giao diện Dark Mode, tự động làm mới mỗi 10 giây):
-  - Hiển thị tổng số video đã xuất và tổng số video đã đăng thành công.
-  - Đồng hồ đếm ngược trực tiếp đến thời điểm sản xuất & xuất bản video tiếp theo.
-  - Bảng danh sách trạng thái chi tiết cho từng nền tảng (YouTube Shorts, Facebook Reels, TikTok).
-  - Nút bấm **▶ Xem video** cho phép phát trực tiếp file video Shorts đã tạo ngay trên trình duyệt (thông qua trình phát video modal tích hợp).
+#### 🔐 Hướng dẫn Đăng nhập & Nạp Cookie (Khuyên dùng cho WSL2 / Windows):
+Trong môi trường WSL2 / Linux headless (không có màn hình GUI trực tiếp):
+1. **Nạp Cookie trực tiếp qua Web Dashboard (`http://localhost:8080#accounts`)**:
+   - Cài tiện ích [Cookie-Editor](https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm) trên Cốc Cốc, Chrome, hoặc Edge.
+   - Đăng nhập TikTok, YouTube Studio, Facebook trên trình duyệt máy bạn bình thường.
+   - Mở tiện ích Cookie-Editor trên tab vừa đăng nhập &rarr; chọn **Export** &rarr; chọn **Export as JSON**.
+   - Mở `http://localhost:8080` &rarr; tab **"🔐 Đăng Nhập & Quản Lý Tài Khoản"** &rarr; Dán mã JSON vào khung và bấm **"Lưu & Nạp Cookie"**. Hệ thống sẽ ngay lập tức chuyển trạng thái sang **✅ Đã đăng nhập**.
+2. **Dùng file trợ lý Windows Helper**:
+   - Chạy file `login_helper_windows.bat` trên Windows để tự động mở sẵn các tab đăng nhập và trang Web Dashboard.
+3. **Thả file cookie có sẵn**:
+   - Bạn có thể đặt file `auth_state.json` (Playwright storage_state) hoặc `cookies.json` trực tiếp vào thư mục gốc dự án.
+
+- **Web Dashboard**: Truy cập trực tiếp tại `http://localhost:8080`:
+  - **Tab 1 - Tiến độ Video**: Thống kê số lượng video, đồng hồ đếm ngược, danh sách trạng thái xuất bản, xem video trực tiếp bằng trình phát modal tích hợp.
+  - **Tab 2 - Quản lý Tài khoản & Cookie**: Thẻ trạng thái thời gian thực cho TikTok, YouTube Studio, Facebook Reels kèm công cụ nạp và xuất session cookie một chạm.
+
 
 

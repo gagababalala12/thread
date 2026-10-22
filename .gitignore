@@ -13,3 +13,8 @@ test_publish_status.json
 browser_profile/
 published_videos/
 temp_current_build/
+auth_state.json
+test_auth_state.json
+cookies.json
+test_cookies.json
+
