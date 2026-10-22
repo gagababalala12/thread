@@ -685,20 +685,48 @@ async def publish_all_platforms(video_path: Path, caption: str, record: dict, dr
 
         page = await context.new_page()
 
-        record["youtube"] = "⏳ Đang đăng..."
-        save_status_record(record)
-        record["youtube"] = await upload_to_youtube_shorts(page, video_path, caption)
-        save_status_record(record)
+        # Kiểm tra trạng thái xác thực từng kênh để chỉ đăng các kênh đã có cookie
+        auth_status = check_auth_status()
+        yt_ready = auth_status["platforms"]["youtube"]["authenticated"]
+        tt_ready = auth_status["platforms"]["tiktok"]["authenticated"]
+        fb_ready = auth_status["platforms"]["facebook"]["authenticated"]
 
-        record["tiktok"] = "⏳ Đang đăng..."
-        save_status_record(record)
-        record["tiktok"] = await upload_to_tiktok(page, video_path, caption)
-        save_status_record(record)
+        # 1. YouTube Shorts
+        if yt_ready:
+            record["youtube"] = "⏳ Đang đăng..."
+            save_status_record(record)
+            record["youtube"] = await upload_to_youtube_shorts(page, video_path, caption)
+            save_status_record(record)
+        else:
+            record["youtube"] = "⏭️ Bỏ qua (Chưa có cookie)"
+            save_status_record(record)
 
-        record["facebook"] = "⏳ Đang đăng..."
-        save_status_record(record)
-        record["facebook"] = await upload_to_facebook_reels(page, video_path, caption)
-        record["overall_status"] = "Hoàn tất (Đã đăng xong)"
+        # 2. TikTok Studio
+        if tt_ready:
+            record["tiktok"] = "⏳ Đang đăng..."
+            save_status_record(record)
+            record["tiktok"] = await upload_to_tiktok(page, video_path, caption)
+            save_status_record(record)
+        else:
+            record["tiktok"] = "⏭️ Bỏ qua (Chưa có cookie)"
+            save_status_record(record)
+
+        # 3. Facebook Reels
+        if fb_ready:
+            record["facebook"] = "⏳ Đang đăng..."
+            save_status_record(record)
+            record["facebook"] = await upload_to_facebook_reels(page, video_path, caption)
+            save_status_record(record)
+        else:
+            record["facebook"] = "⏭️ Bỏ qua (Chưa có cookie)"
+            save_status_record(record)
+
+        # Xác định trạng thái tổng kết
+        posted = [name for name, val in [("YouTube", record["youtube"]), ("TikTok", record["tiktok"]), ("Facebook", record["facebook"])] if "Đã đăng" in val]
+        if posted:
+            record["overall_status"] = f"Hoàn tất (Đã đăng {', '.join(posted)})"
+        else:
+            record["overall_status"] = "Hoàn tất (Chưa nạp cookie kênh nào)"
         save_status_record(record)
 
         # Lưu lại cookies cập nhật mới nhất
@@ -723,6 +751,8 @@ def render_badge(status_text: str) -> str:
         bg, color = "#854d0e", "#fde047"
     elif "Lỗi" in status:
         bg, color = "#991b1b", "#f87171"
+    elif "Bỏ qua" in status:
+        bg, color = "#1e293b", "#94a3b8"
     else:
         bg, color = "#334155", "#cbd5e1"
     return f'<span class="badge" style="background:{bg};color:{color}">{status}</span>'
