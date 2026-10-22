@@ -15,6 +15,7 @@ from threads_scraper import (
     HISTORY_FILE,
     DEFAULT_MODEL,
     VIETNAMESE_ABBREVIATIONS,
+    TARGET_THREADS_URLS,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "HISTORY_FILE",
     "DEFAULT_MODEL",
     "VIETNAMESE_ABBREVIATIONS",
+    "TARGET_THREADS_URLS",
 ]

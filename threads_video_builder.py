@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import random
 import shutil
 import argparse
@@ -404,7 +405,25 @@ def trim_audio_silence(file_path: Path, silence_thresh: int = -40, padding_ms: i
         print(f"[!] Không thể cắt khoảng lặng file {file_path.name}: {e}")
 
 
-async def prepare_media_assets(story_data: dict, temp_dir: Path):
+async def prepare_media_assets(story_data_or_temp_dir=None, temp_dir: Path = None):
+    global STORY_DATA
+    # Hỗ trợ cả 2 cách gọi: (story_data, temp_dir) hoặc (temp_dir)
+    if temp_dir is None:
+        if isinstance(story_data_or_temp_dir, (str, Path)):
+            temp_dir = Path(story_data_or_temp_dir)
+            auto_mod = sys.modules.get("auto_threads_video")
+            story_data = getattr(auto_mod, "STORY_DATA", None) or STORY_DATA or (SAMPLE_STORIES[0] if SAMPLE_STORIES else {})
+        elif isinstance(story_data_or_temp_dir, dict):
+            story_data = story_data_or_temp_dir
+            temp_dir = Path("temp_current_build")
+        else:
+            temp_dir = Path("temp_current_build")
+            story_data = STORY_DATA or (SAMPLE_STORIES[0] if SAMPLE_STORIES else {})
+    else:
+        story_data = story_data_or_temp_dir or STORY_DATA or (SAMPLE_STORIES[0] if SAMPLE_STORIES else {})
+        temp_dir = Path(temp_dir)
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
     segments = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -674,6 +693,7 @@ def build_final_video(
     final_video = clip_with_audio(final_video, final_audio)
 
     try:
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         final_video.write_videofile(
             output_file,
             fps=CONFIG["fps"],

@@ -18,6 +18,11 @@ except ImportError:
 HISTORY_FILE = Path(__file__).resolve().parent / "story_history.json"
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
+TARGET_THREADS_URLS = [
+    "https://www.threads.net/search?q=chuy%E1%BB%87n%20h%C3%A0i&serp_type=default",
+    "https://www.threads.net/search?q=c%C6%B0%E1%BB%9Di%20x%E1%BB%89u&serp_type=default",
+]
+
 VIETNAMESE_ABBREVIATIONS = {
     r"\b(ko|k|khg)\b": "không",
     r"\b(dc|đc)\b": "được",

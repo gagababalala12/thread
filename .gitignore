@@ -8,3 +8,8 @@ test_story_history.json
 output_short*.mp4
 test_output_short.mp4
 temp_build_*/
+publish_status.json
+test_publish_status.json
+browser_profile/
+published_videos/
+temp_current_build/

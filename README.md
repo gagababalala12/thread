@@ -80,3 +80,20 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### 5. Tự động đăng đa nền tảng & Web Dashboard (Port 8080):
+Hệ thống hỗ trợ tự động đăng video lên 3 nền tảng: **YouTube Shorts**, **TikTok Studio**, và **Facebook Reels** theo chu kỳ 4 tiếng / video, đi kèm Web Dashboard trực quan:
+
+```bash
+# Bước 1: Đăng nhập sẵn tài khoản vào profile trình duyệt (chỉ cần chạy 1 lần đầu)
+python auto_publisher.py --login
+
+# Bước 2: Khởi động vòng lặp tự động (4 tiếng / 1 video) & Dashboard theo dõi:
+python auto_publisher.py
+
+# Hoặc chạy thử nghiệm 1 chu kỳ duy nhất:
+python auto_publisher.py --once
+```
+
+- **Web Dashboard**: Truy cập trực tiếp tại `http://localhost:8080` để theo dõi danh sách video đã dựng, mã ID, trạng thái đăng từng kênh và thời gian đếm ngược lần đăng kế tiếp.
+
