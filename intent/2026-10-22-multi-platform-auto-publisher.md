@@ -1,5 +1,5 @@
 ---
-status: verified
+status: shipped
 ---
 # Tự động hóa đăng video đa nền tảng (TikTok, YouTube Shorts, Facebook Reels) & Web Dashboard
 
