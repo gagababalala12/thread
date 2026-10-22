@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import urllib.request
+import urllib.error
 import threading
 from pathlib import Path
 from http.server import HTTPServer
@@ -17,14 +18,21 @@ class TestAutoPublisher(unittest.IsolatedAsyncioTestCase):
         self.test_dir = tempfile.mkdtemp()
         self.original_status_file = auto_publisher.STATUS_FILE
         self.original_profile_dir = auto_publisher.PROFILE_DIR
+        self.original_published_dir = auto_publisher.PUBLISHED_DIR
+
         self.test_status_file = Path(self.test_dir) / "test_publish_status.json"
         self.test_profile_dir = Path(self.test_dir) / "test_browser_profile"
+        self.test_published_dir = Path(self.test_dir) / "test_published_videos"
+        self.test_published_dir.mkdir(parents=True, exist_ok=True)
+
         auto_publisher.STATUS_FILE = self.test_status_file
         auto_publisher.PROFILE_DIR = self.test_profile_dir
+        auto_publisher.PUBLISHED_DIR = self.test_published_dir
 
     def tearDown(self):
         auto_publisher.STATUS_FILE = self.original_status_file
         auto_publisher.PROFILE_DIR = self.original_profile_dir
+        auto_publisher.PUBLISHED_DIR = self.original_published_dir
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_load_status_list_empty_and_corrupt(self):
@@ -80,41 +88,101 @@ class TestAutoPublisher(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data[0]["id"], 2)
         self.assertEqual(data[1]["id"], 1)
 
-    def test_dashboard_http_server(self):
+    def test_render_badge(self):
+        badge_ok = auto_publisher.render_badge("✅ Đã đăng")
+        self.assertIn("#065f46", badge_ok)
+        self.assertIn("✅ Đã đăng", badge_ok)
+
+        badge_waiting = auto_publisher.render_badge("⏳ Đang xử lý")
+        self.assertIn("#854d0e", badge_waiting)
+
+        badge_err = auto_publisher.render_badge("❌ Lỗi (403)")
+        self.assertIn("#991b1b", badge_err)
+
+    def test_dashboard_http_server_and_video_stream(self):
+        # Tạo file video mẫu giả lập trong published_videos
+        dummy_video_path = self.test_published_dir / "test_video_42.mp4"
+        dummy_video_bytes = b"\x00\x00\x00 ftypmp42\x00\x00\x00\x00mp42mp41"
+        dummy_video_path.write_bytes(dummy_video_bytes)
+
         # Chuẩn bị dữ liệu mẫu
         record = {
             "id": 42,
             "created_at": "18:00 - 22/10/2026",
-            "title": "Kiểm thử Web Dashboard",
+            "title": "Kiểm thử Web Dashboard & Stream Video",
             "video_file": "test_video_42.mp4",
             "youtube": "✅ Đã đăng",
             "facebook": "✅ Đã đăng",
             "tiktok": "✅ Đã đăng",
-            "overall_status": "Hoàn tất"
+            "overall_status": "Hoàn tất (Đã đăng xong)"
         }
         auto_publisher.save_status_record(record)
 
-        # Khởi chạy server trên cổng ngẫu nhiên 18088
-        test_port = 18088
+        # Khởi chạy server trên cổng ngẫu nhiên 18090
+        test_port = 18090
         server = auto_publisher.ReusableHTTPServer(("127.0.0.1", test_port), auto_publisher.DashboardHandler)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
 
         try:
+            # 1. Kiểm tra trang chủ Dashboard
             url = f"http://127.0.0.1:{test_port}/"
             with urllib.request.urlopen(url, timeout=5) as response:
                 self.assertEqual(response.status, 200)
                 content = response.read().decode("utf-8")
                 self.assertIn("Trạm Kiểm Soát Auto-Threads Shorts", content)
-                self.assertIn("Kiểm thử Web Dashboard", content)
+                self.assertIn("Kiểm thử Web Dashboard & Stream Video", content)
                 self.assertIn("#42", content)
                 self.assertIn("test_video_42.mp4", content)
-                self.assertIn("YouTube Shorts", content)
-                self.assertIn("Facebook Reels", content)
-                self.assertIn("TikTok", content)
+                self.assertIn("content=\"10\"", content)  # Refresh mỗi 10 giây
+                self.assertIn("Tổng video đã xuất", content)
+                self.assertIn("Đã đăng thành công", content)
+                self.assertIn("countdown-val", content)
+                self.assertIn("▶ Xem video", content)
+
+            # 2. Kiểm tra endpoint streaming video /videos/<filename>
+            video_url = f"http://127.0.0.1:{test_port}/videos/test_video_42.mp4"
+            with urllib.request.urlopen(video_url, timeout=5) as v_response:
+                self.assertEqual(v_response.status, 200)
+                self.assertEqual(v_response.headers.get("Content-Type"), "video/mp4")
+                self.assertEqual(v_response.headers.get("Accept-Ranges"), "bytes")
+                received_bytes = v_response.read()
+                self.assertEqual(received_bytes, dummy_video_bytes)
+
+            # 3. Kiểm tra file không tồn tại trả về 404
+            missing_url = f"http://127.0.0.1:{test_port}/videos/not_found.mp4"
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(missing_url, timeout=5)
+            self.assertEqual(ctx.exception.code, 404)
         finally:
             server.shutdown()
             server.server_close()
+
+    async def test_publish_all_platforms_dry_run(self):
+        record = {
+            "id": 99,
+            "created_at": "20:00 - 22/10/2026",
+            "title": "Dry run test",
+            "video_file": "test_dry.mp4",
+            "youtube": "⏳ Chờ video",
+            "facebook": "⏳ Chờ video",
+            "tiktok": "⏳ Chờ video",
+            "overall_status": "🎬 Đang dựng video..."
+        }
+        auto_publisher.save_status_record(record)
+
+        video_path = Path("/tmp/fake_short.mp4")
+        caption = "Caption #shorts #threads #haihuoc #xuhuong"
+
+        # Thực thi publish_all_platforms ở chế độ dry_run=True
+        await auto_publisher.publish_all_platforms(video_path, caption, record, dry_run=True)
+
+        data = auto_publisher.load_status_list()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["youtube"], "✅ Đã đăng")
+        self.assertEqual(data[0]["tiktok"], "✅ Đã đăng")
+        self.assertEqual(data[0]["facebook"], "✅ Đã đăng")
+        self.assertIn("Hoàn tất", data[0]["overall_status"])
 
     async def test_upload_to_tiktok_success(self):
         mock_page = MagicMock()

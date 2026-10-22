@@ -91,9 +91,17 @@ python auto_publisher.py --login
 # Bước 2: Khởi động vòng lặp tự động (4 tiếng / 1 video) & Dashboard theo dõi:
 python auto_publisher.py
 
-# Hoặc chạy thử nghiệm 1 chu kỳ duy nhất:
-python auto_publisher.py --once
+# Hoặc chạy thử nghiệm 1 chu kỳ giả lập đăng tải (Dry-Run):
+python auto_publisher.py --dry-run --once
+
+# Chỉ mở riêng máy chủ Web Dashboard (cổng 8080):
+python auto_publisher.py --server-only
 ```
 
-- **Web Dashboard**: Truy cập trực tiếp tại `http://localhost:8080` để theo dõi danh sách video đã dựng, mã ID, trạng thái đăng từng kênh và thời gian đếm ngược lần đăng kế tiếp.
+- **Web Dashboard**: Truy cập trực tiếp tại `http://localhost:8080` (giao diện Dark Mode, tự động làm mới mỗi 10 giây):
+  - Hiển thị tổng số video đã xuất và tổng số video đã đăng thành công.
+  - Đồng hồ đếm ngược trực tiếp đến thời điểm sản xuất & xuất bản video tiếp theo.
+  - Bảng danh sách trạng thái chi tiết cho từng nền tảng (YouTube Shorts, Facebook Reels, TikTok).
+  - Nút bấm **▶ Xem video** cho phép phát trực tiếp file video Shorts đã tạo ngay trên trình duyệt (thông qua trình phát video modal tích hợp).
+
 

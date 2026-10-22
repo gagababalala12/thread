@@ -1,27 +1,30 @@
 ---
 status: shipped
 ---
-# Tự động hóa đăng video đa nền tảng (TikTok, YouTube Shorts, Facebook Reels) & Web Dashboard
+# Tự động hóa đăng video đa nền tảng (4 tiếng / video) & Web Dashboard theo dõi (Port 8080)
 
 **Problem**
-Sau khi pipeline tạo video Shorts hoàn chỉnh với kịch bản Threads, đa giọng đọc và kho meme được xây dựng thành công, việc đăng tải video lên các mạng xã hội (TikTok Studio, YouTube Studio, Facebook Reels) vẫn phải thực hiện thủ công, tốn thời gian và không thể duy trì lịch đăng đều đặn mỗi 4 tiếng. Ngoài ra, người dùng thiếu một giao diện trực quan để theo dõi trạng thái đăng, mã video và lịch đăng kế tiếp.
+Sau khi hoàn thiện pipeline dựng video Threads Shorts với AI Audio Director và kho Meme, người dùng cần:
+1. Cơ chế tự động lập lịch xuất bản đều đặn 4 tiếng / 1 video (`INTERVAL_HOURS = 4`), tự động tạo caption kèm hashtag (`#shorts #threads #haihuoc #xuhuong`) từ câu hook mở đầu, và dùng Playwright Persistent Context tự động đăng lên 3 nền tảng: YouTube Shorts, TikTok Studio, Facebook Reels.
+2. Cờ lệnh `--login` để đăng nhập 1 lần ban đầu và cờ `--dry-run` để giả lập quá trình đăng khi kiểm thử hệ thống mà không yêu cầu tài khoản thật.
+3. Bảng điều khiển Web Dashboard trực tuyến ở cổng `8080` giao diện Dark Mode, tự làm mới mỗi 10 giây, hiển thị thống kê tổng số video đã xuất / đã đăng, đồng hồ đếm ngược đến lần đăng kế tiếp, bảng chi tiết từng video kèm nút bấm mở xem trực tiếp video ngay trên trình duyệt.
 
 **Outcome**
-1. Module `auto_publisher.py` tự động hóa toàn bộ quy trình:
-   - Quản lý trạng thái xuất bản dạng cơ sở dữ liệu JSON (`publish_status.json`).
-   - Sử dụng Playwright với persistent context (`browser_profile/`) để lưu giữ phiên đăng nhập của người dùng.
-   - Hỗ trợ chế độ `--login` để người dùng đăng nhập 1 lần ban đầu vào TikTok, YouTube Studio và Facebook.
-   - Tự động đăng video lên 3 nền tảng: YouTube Shorts, TikTok Studio, Facebook Reels kèm caption/hashtags phù hợp.
-   - Vòng lặp tự động sản xuất và đăng video mỗi chu kỳ 4 tiếng (`INTERVAL_HOURS = 4`), đồng thời hỗ trợ flag `--once` để chạy kiểm thử 1 chu kỳ duy nhất.
-2. Web Dashboard trực tuyến (Port 8080):
-   - Chạy trên background thread `http.server` phục vụ giao diện HTML/CSS phong cách Dark mode hiện đại.
-   - Hiển thị danh sách video đã dựng, trạng thái đăng từng nền tảng (YouTube, Facebook, TikTok), thời gian tạo, file video và đếm ngược thời gian chạy tiếp theo (`NEXT_RUN_TIME`).
-   - Tự động làm mới trang (`<meta http-equiv="refresh" content="15">`).
-3. Tương thích 100% với các module hiện có:
-   - `threads_scraper_ai.py` và `threads_scraper.py` xuất `TARGET_THREADS_URLS`.
-   - `threads_video_builder.py` hỗ trợ linh hoạt chữ ký `prepare_media_assets(temp_dir)` và `prepare_media_assets(story_data, temp_dir)` đồng bộ với `auto_threads_video.STORY_DATA`.
-   - `.gitignore` bảo vệ thông tin cá nhân: loại trừ `publish_status.json`, `browser_profile/`, `published_videos/`, `temp_current_build/`.
-4. Toàn bộ test suite tự động đạt 100% PASS (bao gồm các test mới cho `auto_publisher.py`).
+1. Nâng cấp `auto_publisher.py`:
+   - Bộ lập lịch 4 tiếng / video (`INTERVAL_HOURS = 4`) gọi pipeline xuất video vào `published_videos/`.
+   - Caption tự động từ câu đầu kịch bản + hashtag chuẩn `#shorts #threads #haihuoc #xuhuong`.
+   - Hỗ trợ tham số `--login` (`headless=False`), `--dry-run` (giả lập đăng tải), và `--once` (chạy 1 chu kỳ).
+   - Playwright Persistent Context (`browser_profile/`) hỗ trợ `--no-sandbox` tương thích mọi môi trường Linux.
+2. Web Dashboard trực tuyến tại `http://localhost:8080`:
+   - Dark mode hiện đại, `<meta http-equiv="refresh" content="10">` (10 giây).
+   - Thống kê: "Tổng video đã xuất" và "Tổng video đã đăng thành công".
+   - Bộ đếm thời gian / mốc giờ chính xác sẽ đăng video tiếp theo (cộng 4 tiếng từ lần trước).
+   - Bảng danh sách video: Mã ID, Thời gian, Tiêu đề kịch bản, Trạng thái YouTube Shorts, Trạng thái Facebook Reels, Trạng thái TikTok, Trạng thái tổng.
+   - Nút bấm "🎬 Xem video" trực tiếp mở video phát trên trình duyệt qua endpoint `/videos/<filename>`.
+3. Kiểm thử & Chạy thử nghiệm:
+   - Chạy 1 chu kỳ tạo video và cập nhật lên Dashboard ở chế độ kiểm thử (`--dry-run --once`).
+   - Kiểm tra giao diện bảng trạng thái và endpoint phát video hoạt động hoàn hảo.
+   - Bộ unit test `test_auto_publisher.py` đạt 100% PASS.
 
 **Constraints**
 - Giữ nguyên toàn bộ logic đăng video và giao diện Dashboard mà người dùng đã thiết kế.
