@@ -10,6 +10,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from playwright.async_api import async_playwright
 
+# Tự động nạp biến môi trường từ file .env nếu có
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # Import hàm sản xuất video từ pipeline hiện tại
 from auto_threads_video import prepare_media_assets, build_final_video
 from threads_scraper_ai import get_automated_story, TARGET_THREADS_URLS
@@ -269,6 +276,7 @@ def load_saved_cookies(target_file: Path = None) -> list:
 
 def save_cookies(cookies: list, target_file: Path = None, merge: bool = True) -> int:
     """Lưu danh sách cookie vào file định dạng Playwright storage_state (mặc định auth_state.json)."""
+    _YT_VERIFY_CACHE.clear()
     is_default = (target_file is None)
     if target_file is None:
         target_file = AUTH_STATE_FILE
@@ -293,10 +301,12 @@ def save_cookies(cookies: list, target_file: Path = None, merge: bool = True) ->
     }
     target_file.parent.mkdir(parents=True, exist_ok=True)
     target_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _YT_VERIFY_CACHE.clear()
     return len(final_list)
 
 def clear_cookies(platform: str = "all", target_file: Path = None) -> int:
-    """Xóa cookie của một nền tảng hoặc toàn bộ khỏi target_file và cookies.json."""
+    """Xóa cookie của một nền tảng hoặc toàn bộ khỏi target_file, cookies.json và browser_profile SQLite."""
+    _YT_VERIFY_CACHE.clear()
     is_default = (target_file is None)
     if target_file is None:
         target_file = AUTH_STATE_FILE
@@ -317,46 +327,115 @@ def clear_cookies(platform: str = "all", target_file: Path = None) -> int:
                 COOKIES_FILE.unlink()
             except Exception:
                 pass
-        return 0
+        remaining_cnt = 0
+    else:
+        all_cookies = load_saved_cookies(target_file=target_file if not is_default else None)
+        remaining = [
+            c for c in all_cookies
+            if not any(d in c.get("domain", "").lower() for d in domain_filter)
+        ]
+        payload = {"cookies": remaining, "origins": []}
+        target_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    all_cookies = load_saved_cookies(target_file=target_file if not is_default else None)
-    remaining = [
-        c for c in all_cookies
-        if not any(d in c.get("domain", "").lower() for d in domain_filter)
-    ]
-    payload = {"cookies": remaining, "origins": []}
-    target_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Giữ cookies.json đồng bộ khi xóa
+        if is_default and COOKIES_FILE.exists():
+            try:
+                COOKIES_FILE.write_text(json.dumps(remaining, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        remaining_cnt = len(remaining)
 
-    # Giữ cookies.json đồng bộ khi xóa
-    if is_default and COOKIES_FILE.exists():
-        try:
-            COOKIES_FILE.write_text(json.dumps(remaining, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    return len(remaining)
-
-def check_auth_status(cookies: list = None) -> dict:
-    """Kiểm tra trạng thái xác thực của cả 3 nền tảng: YouTube, TikTok, Facebook."""
-    if cookies is None:
-        cookies = load_saved_cookies()
-
-    # Kiểm tra thêm trong SQLite browser_profile/Default/Cookies nếu có
+    # Dọn dẹp cả trong SQLite browser_profile/Default/Cookies nếu có để tránh cookie cũ lưu phiên hết hạn
     profile_db = PROFILE_DIR / "Default" / "Cookies"
-    extra_cookies = []
     if profile_db.exists():
         try:
             import sqlite3
             conn = sqlite3.connect(str(profile_db))
             cur = conn.cursor()
-            cur.execute("SELECT host_key, name FROM cookies")
-            for h, n in cur.fetchall():
-                extra_cookies.append({"domain": h, "name": n})
+            if platform == "all":
+                cur.execute("DELETE FROM cookies")
+            elif domain_filter:
+                for df in domain_filter:
+                    cur.execute("DELETE FROM cookies WHERE host_key LIKE ?", (f"%{df}%",))
+            conn.commit()
             conn.close()
         except Exception:
             pass
 
-    combined = list(cookies) + extra_cookies
+    return remaining_cnt
+
+_YT_VERIFY_CACHE = {}
+
+def verify_youtube_session_online(cookies: list = None, timeout: float = 4.0) -> tuple[bool | None, str]:
+    """Kiểm tra trực tuyến với studio.youtube.com xem session cookie có thực sự hợp lệ không.
+    Trả về (True, '...') nếu phiên hợp lệ;
+    Trả về (False, '...') nếu bị chuyển hướng sang trang đăng nhập Google;
+    Trả về (None, '...') nếu có lỗi mạng hoặc timeout.
+    """
+    if cookies is None:
+        cookies = load_saved_cookies()
+
+    yt_cookies = [c for c in cookies if isinstance(c, dict) and any(d in c.get("domain", "").lower() for d in ["youtube.com", "google.com"])]
+    cookie_hdr = "; ".join([f"{c['name']}={c['value']}" for c in yt_cookies if c.get("name") and c.get("value")])
+    if not cookie_hdr:
+        return False, "Chưa có cookie YouTube"
+
+    cache_key = hash(cookie_hdr)
+    now = time.time()
+    if cache_key in _YT_VERIFY_CACHE:
+        cached_time, cached_res, cached_msg = _YT_VERIFY_CACHE[cache_key]
+        if now - cached_time < 60:
+            return cached_res, cached_msg
+
+    import urllib.request
+    import urllib.error
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    req = urllib.request.Request("https://studio.youtube.com", headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Cookie": cookie_hdr
+    })
+    try:
+        resp = opener.open(req, timeout=timeout)
+        res = (True, "Đã xác thực Studio trực tiếp")
+    except urllib.error.HTTPError as e:
+        loc = str(e.headers.get("Location") or "").lower()
+        if any(kw in loc for kw in ["accounts.google.com", "servicelogin", "signin", "/login"]):
+            res = (False, "Cookie YouTube hết hạn hoặc chưa đăng nhập")
+        elif "studio.youtube.com" in loc:
+            res = (True, "Đã xác thực Studio")
+        else:
+            res = (False, f"Chuyển hướng ({e.code})")
+    except Exception as e:
+        res = (None, f"Không kiểm tra được kết nối ({e})")
+
+    _YT_VERIFY_CACHE[cache_key] = (now, res[0], res[1])
+    return res
+
+def check_auth_status(cookies: list = None, verify_live: bool = False) -> dict:
+    """Kiểm tra trạng thái xác thực của cả 3 nền tảng: YouTube, TikTok, Facebook."""
+    if cookies is not None:
+        combined = list(cookies)
+    else:
+        saved = load_saved_cookies()
+        profile_db = PROFILE_DIR / "Default" / "Cookies"
+        extra_cookies = []
+        if profile_db.exists():
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(profile_db))
+                cur = conn.cursor()
+                cur.execute("SELECT host_key, name FROM cookies")
+                for h, n in cur.fetchall():
+                    extra_cookies.append({"domain": h, "name": n})
+                conn.close()
+            except Exception:
+                pass
+        combined = list(saved) + extra_cookies
 
     # 1. TikTok
     tt_cookies = [c for c in combined if "tiktok.com" in c.get("domain", "").lower()]
@@ -372,13 +451,41 @@ def check_auth_status(cookies: list = None) -> dict:
     # 2. YouTube
     yt_cookies = [c for c in combined if any(d in c.get("domain", "").lower() for d in ["youtube.com", "google.com"])]
     yt_names = {c.get("name") for c in yt_cookies}
-    yt_auth = any(k in yt_names for k in ["LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "SID"])
-    if yt_auth:
-        yt_details = f"Đã đăng nhập ({len(yt_cookies)} cookies, có xác thực Studio)"
-    elif yt_cookies:
+    yt_auth_keys = [k for k in ["LOGIN_INFO", "SID", "SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID", "__Secure-3PSID"] if k in yt_names]
+    has_auth_key = len(yt_auth_keys) > 0
+
+    if not yt_cookies:
+        yt_auth = False
+        yt_details = "Chưa có cookie"
+    elif not has_auth_key:
+        yt_auth = False
         yt_details = f"Chưa đăng nhập ({len(yt_cookies)} cookies, thiếu LOGIN_INFO / SID)"
     else:
-        yt_details = "Chưa có cookie"
+        if verify_live:
+            is_valid, msg = verify_youtube_session_online(yt_cookies)
+            if is_valid is True:
+                yt_auth = True
+                yt_details = f"Đã đăng nhập ({len(yt_cookies)} cookies, {msg})"
+            elif is_valid is False:
+                yt_auth = False
+                yt_details = f"Phiên hết hạn ({msg})"
+            else:
+                yt_auth = True
+                yt_details = f"Đã có cookie xác thực ({len(yt_cookies)} cookies, {msg})"
+        else:
+            cookie_hdr = "; ".join([f"{c['name']}={c.get('value','')}" for c in yt_cookies if c.get("name") and c.get("value")])
+            cache_key = hash(cookie_hdr)
+            cached = _YT_VERIFY_CACHE.get(cache_key)
+            if cached and (time.time() - cached[0] < 60):
+                if cached[1] is False:
+                    yt_auth = False
+                    yt_details = f"Phiên hết hạn ({cached[2]})"
+                else:
+                    yt_auth = True
+                    yt_details = f"Đã đăng nhập ({len(yt_cookies)} cookies, {cached[2]})"
+            else:
+                yt_auth = True
+                yt_details = f"Đã đăng nhập ({len(yt_cookies)} cookies, có xác thực Studio)"
 
     # 3. Facebook
     fb_cookies = [c for c in combined if "facebook.com" in c.get("domain", "").lower()]
@@ -579,6 +686,279 @@ async def dismiss_tiktok_modals(page):
     except Exception:
         pass
 
+async def dismiss_youtube_modals(page):
+    """Đóng các pop-up, modal hướng dẫn, điều khoản hoặc tạo kênh của YouTube Studio nếu xuất hiện."""
+    try:
+        res = page.keyboard.press("Escape")
+        if asyncio.iscoroutine(res):
+            await res
+    except Exception:
+        pass
+
+    # 1. Hộp thoại tạo kênh mới nếu tài khoản chưa có kênh
+    try:
+        chan_dlg = page.locator('ytcp-channel-creation-dialog')
+        cnt = chan_dlg.count()
+        if asyncio.iscoroutine(cnt):
+            cnt = await cnt
+        if isinstance(cnt, int) and cnt > 0:
+            create_chan_btn = chan_dlg.locator('ytcp-button:has-text("Tạo kênh"), ytcp-button:has-text("Create channel"), #create-channel-button').first
+            c_cnt = create_chan_btn.count()
+            if asyncio.iscoroutine(c_cnt):
+                c_cnt = await c_cnt
+            if isinstance(c_cnt, int) and c_cnt > 0:
+                print("[YouTube] Phát hiện hộp thoại tạo kênh, đang tự động bấm xác nhận...")
+                cl = create_chan_btn.click(force=True, timeout=3000)
+                if asyncio.iscoroutine(cl):
+                    await cl
+                await asyncio.sleep(2)
+    except Exception:
+        pass
+
+    # 2. Các pop-up chào mừng, tour, hướng dẫn hoặc điều khoản
+    modal_selectors = [
+        'ytcp-dialog #dismiss-button',
+        'ytcp-dialog ytcp-button:has-text("Đóng")',
+        'ytcp-dialog ytcp-button:has-text("Close")',
+        'ytcp-dialog ytcp-button:has-text("Tôi hiểu")',
+        'ytcp-dialog ytcp-button:has-text("Got it")',
+        'ytcp-dialog ytcp-button:has-text("Bỏ qua")',
+        'ytcp-dialog ytcp-button:has-text("Dismiss")',
+        'ytcp-dialog ytcp-button:has-text("Tiếp tục")',
+        'ytcp-dialog ytcp-button:has-text("Continue")',
+        'tp-yt-paper-dialog #dismiss-button',
+        'tp-yt-paper-dialog ytcp-button:has-text("Đóng")',
+        'tp-yt-paper-dialog ytcp-button:has-text("Close")',
+        'ytcp-feature-discovery-callout #dismiss-button',
+    ]
+    for sel in modal_selectors:
+        try:
+            btns = page.locator(sel)
+            cnt = btns.count()
+            if asyncio.iscoroutine(cnt):
+                cnt = await cnt
+            if isinstance(cnt, int) and cnt > 0:
+                for i in range(min(cnt, 2)):
+                    btn = btns.nth(i) if hasattr(btns, "nth") else btns
+                    vis = btn.is_visible() if hasattr(btn, "is_visible") else True
+                    if asyncio.iscoroutine(vis):
+                        vis = await vis
+                    if vis:
+                        cl = btn.click(force=True, timeout=1000)
+                        if asyncio.iscoroutine(cl):
+                            await cl
+                        await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+    # 3. Gỡ bỏ overlay backdrop nếu còn che màn hình
+    try:
+        backdrops = page.locator('tp-yt-iron-overlay-backdrop.opened, ytcp-dialog-backdrop')
+        if hasattr(backdrops, "evaluate_all"):
+            rem = backdrops.evaluate_all('els => els.forEach(el => el.remove())')
+            if asyncio.iscoroutine(rem):
+                await rem
+    except Exception:
+        pass
+
+# ==========================================
+# 2.5. TỐI ƯU TIÊU ĐỀ & HASHTAG CHO REELS / SHORTS / TIKTOK
+# ==========================================
+VIRAL_HASHTAGS = "#shorts #reels #tiktok #haihuoc #xuhuong #chuyenvuithoret #drama #giaitri #cuoivolua #trending #viral #fyp"
+
+def _clean_story_lines(story: dict) -> list:
+    """Trích xuất danh sách các câu thoại sạch từ story."""
+    lines = []
+    if not isinstance(story, dict):
+        return lines
+    for card in story.get("cards", []):
+        raw_lines = card.get("lines", []) if isinstance(card, dict) else getattr(card, "lines", [])
+        for l in raw_lines:
+            txt = l.get("text", "") if isinstance(l, dict) else getattr(l, "text", str(l))
+            if txt and str(txt).strip():
+                lines.append(str(txt).strip())
+
+    if not lines:
+        for fallback_k in ["content", "text", "body", "description", "script"]:
+            val = story.get(fallback_k)
+            if val and isinstance(val, str):
+                lines = [s.strip() for s in val.splitlines() if s.strip()]
+                break
+    return lines
+
+def _generate_offline_caption(story: dict) -> dict:
+    """Tạo tiêu đề và caption dự phòng chất lượng cao khi không có kết nối Gemini API."""
+    if not isinstance(story, dict):
+        story = {}
+    import re
+    raw_title = str(story.get("title", "") or "").strip()
+    if "#" in raw_title:
+        raw_title = re.sub(r'#\S+', '', raw_title).strip()
+        raw_title = re.sub(r'\s+', ' ', raw_title).strip()
+
+    lines = _clean_story_lines(story)
+    first_line = lines[0] if lines else ""
+    full_text = " ".join(lines)
+    text_lower = full_text.lower()
+
+    is_generic_title = (
+        not raw_title
+        or raw_title in ["Kịch bản viral", "Story", "Kịch bản mẫu", "Kịch bản hài hước"]
+        or raw_title.lower().startswith("hôm nay tôi quyết định")
+        or raw_title.lower().startswith("hôm nay em ")
+        or raw_title.lower().startswith("hôm nay mình ")
+    )
+    if not is_generic_title:
+        title = raw_title
+    else:
+        if any(w in text_lower for w in ["người tốt", "nhường ghế", "xe buýt"]):
+            title = "Cái kết đắng khi thử làm người tốt"
+        elif any(w in text_lower for w in ["salon", "kiểu tóc", "cắt tóc", "thợ tóc"]):
+            title = "Bài học nhớ đời khi đi đổi kiểu tóc"
+        elif any(w in text_lower for w in ["giảm cân", "chạy bộ", "huấn luyện viên", "khóa học"]):
+            title = "Cú lừa ngoạn mục từ khóa học giảm cân"
+        elif any(w in text_lower for w in ["tarot", "bói", "thầy bói"]):
+            title = "Cái kết hài hước khi đi xem bói Tarot"
+        elif any(w in text_lower for w in ["tập gym", "thể hình", "tập thể dục"]):
+            title = "Bài học nhớ đời khi đi tập thể hình"
+        elif any(w in text_lower for w in ["phỏng vấn", "xin việc", "nhân sự", "cv"]):
+            title = "Pha phỏng vấn xin việc bất ổn nhất năm"
+        elif any(w in text_lower for w in ["cầu hôn", "nhà hàng sang trọng", "người yêu"]):
+            title = "Màn cầu hôn bất ổn không nhịn được cười"
+        elif any(w in text_lower for w in ["rửa bát", "bài văn", "người hùng", "tiểu minh"]):
+            title = "Cú twist khó đỡ trong bài văn tả bố"
+        elif any(w in text_lower for w in ["nỏ thần", "an dương vương", "lịch sử"]):
+            title = "Ai đã lấy cắp nỏ thần của An Dương Vương"
+        elif any(w in text_lower for w in ["điểm mười", "kiểm tra toán", "thưởng nóng"]):
+            title = "Cái kết của bài kiểm tra Toán điểm mười"
+        elif any(w in text_lower for w in ["chó cảnh", "mua chó", "thú cưng", "nuôi chó", "tiếng sủa"]):
+            title = "Cái kết bất ngờ khi mua chó cảnh"
+        elif any(w in text_lower for w in ["mèo", "nuôi mèo", "mèo hoang", "hoàng thượng"]):
+            title = "Pha nuôi mèo bất ổn nhất hệ mặt trời"
+        elif first_line.lower().startswith("hôm nay tôi quyết định "):
+            core = first_line[len("hôm nay tôi quyết định "):].strip().rstrip(".")
+            title = f"Cái kết bất ngờ khi {core}"
+        elif first_line:
+            title = f"Cú twist khó đỡ: {first_line[:35]}..."
+        else:
+            title = "Mẩu chuyện cười ngắn siêu hài hước"
+
+    if "#" in title:
+        title = re.sub(r'#\S+', '', title).strip()
+        title = re.sub(r'\s+', ' ', title).strip()
+    if len(title) > 60:
+        truncated = title[:57].rstrip()
+        if " " in truncated:
+            title = truncated.rsplit(" ", 1)[0] + "..."
+        else:
+            title = truncated + "..."
+
+    if first_line:
+        hook = f"{first_line} Xem đến cuối để thấy cú twist cười bể bụng 🤣"
+    else:
+        hook = "Cú twist cười ra nước mắt, xem đến cuối không nhịn được cười! 🤣"
+
+    hashtags = VIRAL_HASHTAGS
+    full_caption = f"{title} 🤣\n\n{hook}\n\n{hashtags}"
+    yt_title = f"{title[:85].strip()} #Shorts"
+    tiktok_caption = f"{title} | {hook} {hashtags}"
+    fb_caption = f"{title}\n\n{hook}\n\n{hashtags}"
+
+    return {
+        "title": title,
+        "hook": hook,
+        "hashtags": hashtags,
+        "caption": full_caption,
+        "youtube_title": yt_title,
+        "tiktok_caption": tiktok_caption,
+        "facebook_caption": fb_caption,
+    }
+
+def generate_reel_caption(story: dict, api_key: str | None = None) -> dict:
+    """Tạo tiêu đề viral rõ ràng (dưới 60 ký tự, không chứa hashtag) và caption phong phú kèm hashtag cho Reels/Shorts/TikTok.
+    Ưu tiên gọi Gemini AI để sáng tạo tiêu đề & hook giật tít, tự động fallback sang bộ tạo tiêu đề offline nếu không có API key.
+    """
+    if not isinstance(story, dict):
+        return _generate_offline_caption(story)
+
+    resolved_api_key = api_key or os.environ.get("GEMINI_API_KEY")
+    if not resolved_api_key or resolved_api_key == "invalid_dummy_key":
+        return _generate_offline_caption(story)
+
+    lines = _clean_story_lines(story)
+    raw_title = str(story.get("title", "") or "").strip()
+    story_summary = "\n".join(lines) if lines else raw_title
+
+    if not story_summary:
+        return _generate_offline_caption(story)
+
+    try:
+        from google import genai
+        from google.genai import types
+        from pydantic import BaseModel, Field
+
+        class ReelMeta(BaseModel):
+            title: str = Field(description="Tiêu đề video ngắn hấp dẫn, tò mò, hài hước, dưới 60 ký tự, tiếng Việt đầy đủ dấu, không chứa hashtag")
+            hook: str = Field(description="1-2 câu hook mở đầu dẫn dắt người xem vào video")
+
+        client = genai.Client(api_key=resolved_api_key, http_options=types.HttpOptions(timeout=25000))
+        prompt = f"""Bạn là chuyên gia sáng tạo nội dung mạng xã hội triệu view (Facebook Reels, TikTok, YouTube Shorts).
+Hãy viết tiêu đề và câu hook viral cho mẩu chuyện cười sau:
+\"\"\"{story_summary}\"\"\"
+
+Yêu cầu:
+1. title: Tiêu đề cực kỳ cuốn hút, giật tít hài hước hoặc tò mò (ví dụ: "Bí quyết nhịn cười khi...", "Cái kết đắng khi thử làm người tốt...", "Bài học nhớ đời khi đi đổi kiểu tóc...", "Khóa học giảm cân bất ổn nhất năm"), TUYỆT ĐỐI dưới 60 ký tự, tiếng Việt chuẩn có dấu UTF-8, KHÔNG chứa hashtag trong title.
+2. hook: 1-2 câu mở đầu kích thích người xem xem đến hết video."""
+
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ReelMeta,
+                temperature=0.7,
+            )
+        )
+
+        meta_data = None
+        if hasattr(resp, "parsed") and resp.parsed is not None:
+            if isinstance(resp.parsed, ReelMeta):
+                meta_data = resp.parsed.model_dump()
+            elif isinstance(resp.parsed, dict):
+                meta_data = resp.parsed
+        if not meta_data and getattr(resp, "text", None):
+            meta_data = json.loads(resp.text)
+
+        if meta_data and meta_data.get("title"):
+            import re
+            title = str(meta_data["title"]).strip()
+            title = re.sub(r'#\S+', '', title).strip()
+            title = re.sub(r'\s+', ' ', title).strip()
+            if len(title) > 60:
+                truncated = title[:57].rstrip()
+                if " " in truncated:
+                    title = truncated.rsplit(" ", 1)[0] + "..."
+                else:
+                    title = truncated + "..."
+            hook = str(meta_data.get("hook", "")).strip() or (lines[0] if lines else "")
+            hashtags = VIRAL_HASHTAGS
+            full_caption = f"{title} 🤣\n\n{hook}\n\n{hashtags}"
+            yt_title = f"{title[:85].strip()} #Shorts"
+            return {
+                "title": title,
+                "hook": hook,
+                "hashtags": hashtags,
+                "caption": full_caption,
+                "youtube_title": yt_title,
+                "tiktok_caption": f"{title} | {hook} {hashtags}",
+                "facebook_caption": f"{title}\n\n{hook}\n\n{hashtags}",
+            }
+    except Exception as e:
+        print(f"[!] Gọi Gemini tối ưu tiêu đề gặp lỗi ({e}), chuyển sang bộ tạo tiêu đề offline...")
+
+    return _generate_offline_caption(story)
+
 # ==========================================
 # 3. TỰ ĐỘNG ĐĂNG BÀI ĐA NỀN TẢNG (PLAYWRIGHT)
 # ==========================================
@@ -684,54 +1064,217 @@ async def upload_to_tiktok(page, video_path: Path, caption: str) -> str:
 
 async def upload_to_youtube_shorts(page, video_path: Path, title: str) -> str:
     try:
+        # 1. Kiểm tra nhanh cookie YouTube trong phiên trình duyệt
+        try:
+            if hasattr(page, "context") and hasattr(page.context, "cookies"):
+                c_fn = page.context.cookies()
+                ctx_cookies = await c_fn if asyncio.iscoroutine(c_fn) else c_fn
+                if isinstance(ctx_cookies, list):
+                    yt_c = [c for c in ctx_cookies if isinstance(c, dict) and any(d in c.get("domain", "").lower() for d in ["youtube.com", "google.com"])]
+                    has_auth = any(c.get("name") in ["LOGIN_INFO", "SID", "SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID", "__Secure-3PSID"] for c in yt_c)
+                    if not yt_c or not has_auth:
+                        print("[!] Không tìm thấy cookie xác thực YouTube trong phiên trình duyệt.")
+                        return "⏭️ Bỏ qua (Chưa có cookie YouTube)"
+        except Exception:
+            pass
+
         print("[YouTube] Đang truy cập YouTube Studio...")
         await page.goto("https://studio.youtube.com", wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(5)
 
-        # Bấm nút Tạo (Create) -> Tải video lên
-        create_btn = page.locator('#create-icon, ytcp-button:has-text("Tạo"), ytcp-button:has-text("Create")').first
-        await create_btn.click()
+        # 2. Kiểm tra nếu bị chuyển hướng sang trang đăng nhập Google hoặc Studio yêu cầu đăng nhập
+        try:
+            url_str = page.url() if callable(getattr(page, "url", None)) else str(getattr(page, "url", "") or "")
+            url_lower = url_str.lower()
+            if any(kw in url_lower for kw in ["accounts.google.com", "servicelogin", "service_login", "signin", "/login"]):
+                print(f"[!] YouTube Studio chuyển hướng đến trang đăng nhập ({url_str}). Cookie YouTube đã hết hạn hoặc chưa đăng nhập.")
+                return "❌ Lỗi (Cookie YouTube hết hạn hoặc chưa đăng nhập)"
+        except Exception:
+            pass
+
+        # 3. Đóng các pop-up, modal tạo kênh, tour hoặc điều khoản nếu có
+        await dismiss_youtube_modals(page)
+
+        # 4. Bấm nút Tạo (Create) -> Tải video lên với selector kiên cố và force click fallback
+        create_btn = page.locator('#create-icon, ytcp-button#create-icon, ytcp-button:has-text("Tạo"), ytcp-button:has-text("Create"), ytcp-button[aria-label*="Tạo"], ytcp-button[aria-label*="Create"], #upload-icon, #upload-button, ytcp-button#upload-button').first
+        try:
+            c_cnt = create_btn.count()
+            if asyncio.iscoroutine(c_cnt):
+                c_cnt = await c_cnt
+            if isinstance(c_cnt, int) and c_cnt > 0:
+                try:
+                    cl = create_btn.click(force=True, timeout=10000)
+                    if asyncio.iscoroutine(cl):
+                        await cl
+                except Exception:
+                    eval_cl = create_btn.evaluate("el => el.click()")
+                    if asyncio.iscoroutine(eval_cl):
+                        await eval_cl
+            else:
+                cl = create_btn.click(force=True, timeout=10000)
+                if asyncio.iscoroutine(cl):
+                    await cl
+        except Exception as e:
+            # Nếu không tìm thấy nút Tạo, kiểm tra xem có đang ở trang login không
+            url_str = page.url() if callable(getattr(page, "url", None)) else str(getattr(page, "url", "") or "")
+            if any(kw in url_str.lower() for kw in ["accounts.google.com", "signin"]):
+                return "❌ Lỗi (Cookie YouTube hết hạn hoặc chưa đăng nhập)"
+            raise e
+
         await asyncio.sleep(2)
 
-        upload_item = page.locator('tp-yt-paper-item:has-text("Tải video lên"), tp-yt-paper-item:has-text("Upload videos")').first
-        await upload_item.click()
-        await asyncio.sleep(2)
+        # 5. Bấm mục "Tải video lên" trong dropdown menu nếu modal upload chưa mở
+        upload_modal = page.locator('ytcp-uploads-dialog, #dialog[aria-label*="Tải video"], #dialog[aria-label*="Upload"]')
+        is_modal_open = False
+        try:
+            m_cnt = upload_modal.count()
+            if asyncio.iscoroutine(m_cnt):
+                m_cnt = await m_cnt
+            if isinstance(m_cnt, int) and m_cnt > 0:
+                is_modal_open = True
+        except Exception:
+            pass
 
-        file_input = page.locator('input[type="file"]')
-        await file_input.set_input_files(str(video_path.resolve()))
+        if not is_modal_open:
+            upload_item = page.locator('tp-yt-paper-item:has-text("Tải video lên"), tp-yt-paper-item:has-text("Upload videos"), tp-yt-paper-item:has-text("Upload video"), #text-item-0').first
+            try:
+                u_cnt = upload_item.count()
+                if asyncio.iscoroutine(u_cnt):
+                    u_cnt = await u_cnt
+                if isinstance(u_cnt, int) and u_cnt > 0:
+                    try:
+                        cl = upload_item.click(force=True, timeout=8000)
+                        if asyncio.iscoroutine(cl):
+                            await cl
+                    except Exception:
+                        eval_cl = upload_item.evaluate("el => el.click()")
+                        if asyncio.iscoroutine(eval_cl):
+                            await eval_cl
+                else:
+                    cl = upload_item.click(force=True, timeout=8000)
+                    if asyncio.iscoroutine(cl):
+                        await cl
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
+        # 6. Chọn file video tải lên
+        file_input = page.locator('input[type="file"]').first
+        try:
+            if hasattr(page, "wait_for_selector"):
+                w = page.wait_for_selector('input[type="file"]', timeout=15000)
+                if asyncio.iscoroutine(w):
+                    await w
+        except Exception:
+            pass
+
+        set_files = file_input.set_input_files(str(video_path.resolve()))
+        if asyncio.iscoroutine(set_files):
+            await set_files
         await asyncio.sleep(10)
 
-        # Điền tiêu đề kèm #Shorts
-        title_box = page.locator('#textbox').first
-        if await title_box.count() > 0:
-            await title_box.click()
-            await page.keyboard.press("Control+A")
-            await page.keyboard.type(f"{title[:85]} #Shorts", delay=20)
+        # 7. Điền tiêu đề kèm #Shorts (chuẩn hóa độ dài <= 95 ký tự)
+        clean_yt_title = str(title or "").strip()
+        if "#shorts" not in clean_yt_title.lower():
+            clean_yt_title = f"{clean_yt_title[:85].strip()} #Shorts"
+        else:
+            clean_yt_title = clean_yt_title[:95].strip()
 
-        # Chọn "Không, nội dung này không dành cho trẻ em"
-        not_for_kids = page.locator('tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]').first
-        if await not_for_kids.count() > 0:
-            await not_for_kids.click()
+        title_box = page.locator('#title-textarea #textbox, #textbox[aria-label*="tiêu đề"], #textbox[aria-label*="title"], ytcp-social-suggestions-textbox #textbox, #textbox').first
+        try:
+            t_cnt = title_box.count()
+            if asyncio.iscoroutine(t_cnt):
+                t_cnt = await t_cnt
+            if not isinstance(t_cnt, int) or t_cnt > 0:
+                try:
+                    cl = title_box.click(force=True)
+                    if asyncio.iscoroutine(cl):
+                        await cl
+                except Exception:
+                    pass
+                p1 = page.keyboard.press("Control+A")
+                if asyncio.iscoroutine(p1):
+                    await p1
+                p2 = page.keyboard.press("Backspace")
+                if asyncio.iscoroutine(p2):
+                    await p2
+                tp = page.keyboard.type(clean_yt_title, delay=20)
+                if asyncio.iscoroutine(tp):
+                    await tp
+        except Exception:
+            pass
 
-        # Nhấn Tiếp (Next) 3 lần
-        for _ in range(3):
-            next_btn = page.locator('#next-button').first
-            await next_btn.click()
-            await asyncio.sleep(2)
+        # 8. Chọn "Không, nội dung này không dành cho trẻ em"
+        not_for_kids = page.locator('tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], tp-yt-paper-radio-button:has-text("Không, nội dung này không dành cho trẻ em"), tp-yt-paper-radio-button:has-text("No, it\'s not made for kids")').first
+        try:
+            k_cnt = not_for_kids.count()
+            if asyncio.iscoroutine(k_cnt):
+                k_cnt = await k_cnt
+            if not isinstance(k_cnt, int) or k_cnt > 0:
+                if hasattr(not_for_kids, "scroll_into_view_if_needed"):
+                    s = not_for_kids.scroll_into_view_if_needed()
+                    if asyncio.iscoroutine(s):
+                        await s
+                cl = not_for_kids.click(force=True)
+                if asyncio.iscoroutine(cl):
+                    await cl
+        except Exception:
+            pass
 
-        # Chọn Công khai (Public) và nhấn Xuất bản
-        public_radio = page.locator('tp-yt-paper-radio-button[name="PUBLIC"]').first
-        if await public_radio.count() > 0:
-            await public_radio.click()
-            await asyncio.sleep(2)
+        # 9. Nhấn Tiếp (Next) cho đến khi sang bước Công khai (tối đa 4 lần)
+        public_radio = page.locator('tp-yt-paper-radio-button[name="PUBLIC"], tp-yt-paper-radio-button:has-text("Công khai"), tp-yt-paper-radio-button:has-text("Public")').first
+        for _ in range(4):
+            pub_cnt = public_radio.count()
+            if asyncio.iscoroutine(pub_cnt):
+                pub_cnt = await pub_cnt
+            if isinstance(pub_cnt, int) and pub_cnt > 0:
+                pub_vis = public_radio.is_visible()
+                if asyncio.iscoroutine(pub_vis):
+                    pub_vis = await pub_vis
+                if pub_vis:
+                    break
 
-        done_btn = page.locator('#done-button').first
-        await done_btn.click()
-        await asyncio.sleep(8)
+            next_btn = page.locator('#next-button, ytcp-button#next-button, ytcp-button:has-text("Tiếp"), ytcp-button:has-text("Next")').first
+            n_cnt = next_btn.count()
+            if asyncio.iscoroutine(n_cnt):
+                n_cnt = await n_cnt
+            if not isinstance(n_cnt, int) or n_cnt > 0:
+                try:
+                    cl = next_btn.click(force=True)
+                    if asyncio.iscoroutine(cl):
+                        await cl
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+        # 10. Chọn Công khai (Public) và nhấn Xuất bản
+        try:
+            cl = public_radio.click(force=True)
+            if asyncio.iscoroutine(cl):
+                await cl
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+        done_btn = page.locator('#done-button, ytcp-button#done-button, ytcp-button:has-text("Xuất bản"), ytcp-button:has-text("Publish"), ytcp-button:has-text("Lưu"), ytcp-button:has-text("Save")').first
+        d_cnt = done_btn.count()
+        if asyncio.iscoroutine(d_cnt):
+            d_cnt = await d_cnt
+        if not isinstance(d_cnt, int) or d_cnt > 0:
+            try:
+                cl = done_btn.click(force=True)
+                if asyncio.iscoroutine(cl):
+                    await cl
+            except Exception:
+                pass
+            await asyncio.sleep(8)
         return "✅ Đã đăng"
     except Exception as e:
-        print(f"[!] Lỗi đăng YouTube: {e}")
-        return f"❌ Lỗi ({str(e)[:25]}...)"
+        err_str = str(e)
+        print(f"[!] Lỗi đăng YouTube: {err_str}")
+        if "Timeout" in err_str:
+            return "❌ Lỗi (Timeout chờ giao diện Studio)"
+        return f"❌ Lỗi ({err_str[:25]}...)"
 
 async def upload_to_facebook_reels(page, video_path: Path, caption: str) -> str:
     try:
@@ -765,7 +1308,15 @@ async def upload_to_facebook_reels(page, video_path: Path, caption: str) -> str:
         print(f"[!] Lỗi đăng Facebook: {e}")
         return f"❌ Lỗi ({str(e)[:25]}...)"
 
-async def publish_all_platforms(video_path: Path, caption: str, record: dict, dry_run: bool = False):
+async def publish_all_platforms(
+    video_path: Path,
+    caption: str,
+    record: dict,
+    dry_run: bool = False,
+    yt_title: str = None,
+    tiktok_caption: str = None,
+    fb_caption: str = None,
+):
     if dry_run:
         print(f"[Dry-Run] Bắt đầu giả lập đăng bài: {video_path.name}")
         record["youtube"] = "⏳ Đang đăng..."
@@ -814,10 +1365,20 @@ async def publish_all_platforms(video_path: Path, caption: str, record: dict, dr
 
         # 1. YouTube Shorts
         if yt_ready:
-            record["youtube"] = "⏳ Đang đăng..."
-            save_status_record(record)
-            record["youtube"] = await upload_to_youtube_shorts(page, video_path, caption)
-            save_status_record(record)
+            # Kiểm tra nhanh endpoint studio.youtube.com để tránh tốn thời gian timeout trình duyệt nếu cookie đã hết hạn
+            ctx_cookies = await context.cookies()
+            check_cookies = saved_cookies if saved_cookies else ctx_cookies
+            is_valid, verify_msg = verify_youtube_session_online(check_cookies)
+            if is_valid is False:
+                print(f"[YouTube] Phiên đăng nhập không hợp lệ ({verify_msg}).")
+                record["youtube"] = "❌ Lỗi (Cookie YouTube hết hạn hoặc chưa đăng nhập)"
+                save_status_record(record)
+            else:
+                record["youtube"] = "⏳ Đang đăng..."
+                save_status_record(record)
+                upload_yt_title = yt_title or record.get("title") or caption
+                record["youtube"] = await upload_to_youtube_shorts(page, video_path, upload_yt_title)
+                save_status_record(record)
         else:
             record["youtube"] = "⏭️ Bỏ qua (Chưa có cookie)"
             save_status_record(record)
@@ -826,7 +1387,8 @@ async def publish_all_platforms(video_path: Path, caption: str, record: dict, dr
         if tt_ready:
             record["tiktok"] = "⏳ Đang đăng..."
             save_status_record(record)
-            record["tiktok"] = await upload_to_tiktok(page, video_path, caption)
+            upload_tt_caption = tiktok_caption or caption
+            record["tiktok"] = await upload_to_tiktok(page, video_path, upload_tt_caption)
             save_status_record(record)
         else:
             record["tiktok"] = "⏭️ Bỏ qua (Chưa có cookie)"
@@ -836,7 +1398,8 @@ async def publish_all_platforms(video_path: Path, caption: str, record: dict, dr
         if fb_ready:
             record["facebook"] = "⏳ Đang đăng..."
             save_status_record(record)
-            record["facebook"] = await upload_to_facebook_reels(page, video_path, caption)
+            upload_fb_caption = fb_caption or caption
+            record["facebook"] = await upload_to_facebook_reels(page, video_path, upload_fb_caption)
             save_status_record(record)
         else:
             record["facebook"] = "⏭️ Bỏ qua (Chưa có cookie)"
@@ -906,8 +1469,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # 1. API: Trạng thái xác thực tài khoản
-        if self.path == "/api/auth-status":
-            auth_info = check_auth_status()
+        if self.path.startswith("/api/auth-status"):
+            verify_live = ("verify=1" in self.path)
+            auth_info = check_auth_status(verify_live=verify_live)
             res_body = json.dumps({"success": True, "auth": auth_info}, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1239,8 +1803,26 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
                 </div>
             </div>
 
+            <div class="stat-card" style="background:#1e1b4b;border:1px solid #6366f1;border-radius:14px;padding:18px 22px;margin-bottom:18px">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+                    <span style="font-size:20px">🔴</span>
+                    <h3 style="margin:0;font-size:16px;color:#c7d2fe">Hướng Dẫn Nạp Cookie Cho Tab "YouTube" Đang Mở Trên Trình Duyệt:</h3>
+                </div>
+                <p style="font-size:13px;color:#e0e7ff;margin:0 0 10px 0;line-height:1.6">
+                    Trình duyệt của bạn đang có sẵn tab <strong>YouTube</strong> (đã đăng nhập). Hãy xuất cookie sang đây chỉ với 3 thao tác:
+                </p>
+                <ol style="margin:0;padding-left:22px;color:#cbd5e1;line-height:1.8;font-size:13px">
+                    <li>Chuyển sang tab <strong>YouTube</strong> đang mở trên trình duyệt.</li>
+                    <li>Bấm biểu tượng tiện ích <strong>Cookie-Editor</strong> trên góc trình duyệt &rarr; chọn <strong>Export</strong> &rarr; chọn <strong>Export as JSON</strong>.</li>
+                    <li>Quay lại tab này &rarr; chọn nền tảng <strong>YouTube Studio (.youtube.com)</strong> &rarr; dán vào ô trên &rarr; bấm <strong>💾 Lưu & Nạp Cookie</strong>.</li>
+                </ol>
+                <div style="margin-top:10px;font-size:12px;color:#94a3b8">
+                    <em>💡 Yêu cầu: Cookie xuất ra cần chứa <code>LOGIN_INFO</code> và <code>SID</code> từ tài khoản Google/YouTube đã đăng nhập để YouTube Studio cấp quyền tải lên.</em>
+                </div>
+            </div>
+
             <div class="stat-card" style="background:#131c2e;border-color:#1e3a8a">
-                <h3 style="margin-top:0;font-size:16px;color:#93c5fd">💡 Hướng Dẫn Nhanh 4 Bước Lấy Cookie Trên Windows (Cốc Cốc, Chrome, Edge):</h3>
+                <h3 style="margin-top:0;font-size:16px;color:#93c5fd">💡 Hướng Dẫn Chung 4 Bước Lấy Cookie Trên Windows (Cốc Cốc, Chrome, Edge):</h3>
                 <ol style="margin:0;padding-left:22px;color:#cbd5e1;line-height:1.7;font-size:14px">
                     <li>Cài tiện ích <strong><a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" style="color:#60a5fa">Cookie-Editor</a></strong> trên trình duyệt của bạn (hoàn toàn miễn phí, an toàn).</li>
                     <li>Bấm nút tím <strong>"🚀 Mở Cả 3 Trang Đăng Nhập"</strong> ở trên và đăng nhập tài khoản của bạn bình thường.</li>
@@ -1430,7 +2012,7 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
 
         async function refreshAuthStatus() {{
             try {{
-                const resp = await fetch("/api/auth-status");
+                const resp = await fetch("/api/auth-status?verify=1");
                 const data = await resp.json();
                 if (data.success && data.auth) {{
                     const auth = data.auth;
@@ -1522,7 +2104,7 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
                     return
 
                 total_saved = save_cookies(parsed, merge=True)
-                auth_info = check_auth_status()
+                auth_info = check_auth_status(verify_live=True)
                 res_body = json.dumps({
                     "success": True,
                     "count": len(parsed),
@@ -1577,8 +2159,11 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
 
         self.send_error(404, "Endpoint Not Found")
 
-class ReusableHTTPServer(HTTPServer):
+from socketserver import ThreadingMixIn
+
+class ReusableHTTPServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 def start_dashboard_server(port=8080):
     try:
@@ -1741,11 +2326,16 @@ async def run_single_cycle(video_counter: int, dry_run: bool = False) -> dict:
             story = auto_threads_video.SAMPLE_STORIES[(video_counter - 1) % len(auto_threads_video.SAMPLE_STORIES)]
 
         auto_threads_video.STORY_DATA = story
-        first_line = story["cards"][0]["lines"][0]
-        text_hook = first_line["text"] if isinstance(first_line, dict) else str(first_line)
-        caption = f"{text_hook} #shorts #threads #haihuoc #xuhuong"
 
-        record["title"] = text_hook[:70] + "..."
+        # Tạo tiêu đề rõ ràng phù hợp với reel và hashtag phong phú
+        reel_meta = generate_reel_caption(story, api_key=api_key)
+        clean_title = reel_meta["title"]
+        caption = reel_meta["caption"]
+        yt_title = reel_meta["youtube_title"]
+        tt_caption = reel_meta.get("tiktok_caption", caption)
+        fb_caption = reel_meta.get("facebook_caption", caption)
+
+        record["title"] = clean_title
         save_status_record(record)
 
         temp_dir = Path("temp_current_build")
@@ -1759,7 +2349,15 @@ async def run_single_cycle(video_counter: int, dry_run: bool = False) -> dict:
         # Bước 2: Đăng tải (hoặc giả lập đăng nếu dry_run)
         record["overall_status"] = "🚀 Đang đăng lên 3 kênh..."
         save_status_record(record)
-        await publish_all_platforms(output_path, caption, record, dry_run=dry_run)
+        await publish_all_platforms(
+            output_path,
+            caption,
+            record,
+            dry_run=dry_run,
+            yt_title=yt_title,
+            tiktok_caption=tt_caption,
+            fb_caption=fb_caption,
+        )
 
     except Exception as e:
         print(f"[!] [Chu kỳ #{video_counter}] Lỗi xảy ra: {e}")

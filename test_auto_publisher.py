@@ -7,6 +7,7 @@ import tempfile
 import urllib.request
 import urllib.error
 import threading
+import time
 from pathlib import Path
 from http.server import HTTPServer
 
@@ -682,7 +683,346 @@ class TestAutoPublisher(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(res)
             self.assertIn("AutoPublisher_Login.bat", res)
 
+    def test_generate_reel_caption_offline_fallback(self):
+        """Kiểm tra bộ tạo tiêu đề & hashtag ngoại tuyến khi không có Gemini."""
+        story = {
+            "title": "Tiểu Minh và bài văn tả người hùng",
+            "cards": [
+                {"lines": [{"text": "Trong giờ tập làm văn, cô giáo yêu cầu cả lớp viết về một người hùng."}]},
+                {"lines": [{"text": "Tiểu Minh ngây thơ đáp: Em tả lại cảnh bố em đi rửa bát đấy ạ!"}]}
+            ]
+        }
+        res = auto_publisher.generate_reel_caption(story, api_key="invalid_dummy_key")
+        self.assertIn("title", res)
+        self.assertIn("hook", res)
+        self.assertIn("hashtags", res)
+        self.assertIn("youtube_title", res)
+        self.assertIn("tiktok_caption", res)
+        self.assertIn("caption", res)
+
+        # Tiêu đề rõ ràng, dưới 60 ký tự, không chứa hashtag
+        self.assertLessEqual(len(res["title"]), 60)
+        self.assertNotIn("#", res["title"])
+        self.assertEqual(res["title"], "Tiểu Minh và bài văn tả người hùng")
+
+        # YouTube Shorts title có chứa #Shorts
+        self.assertIn("#Shorts", res["youtube_title"])
+
+        # Hashtags phong phú
+        for tag in ["#shorts", "#reels", "#tiktok", "#haihuoc", "#xuhuong", "#chuyenvuithoret"]:
+            self.assertIn(tag, res["hashtags"])
+            self.assertIn(tag, res["caption"])
+
+    def test_generate_reel_caption_theme_inference(self):
+        """Kiểm tra tự động suy đoán tiêu đề giật tít theo chủ đề câu chuyện."""
+        # Chủ đề làm người tốt / xe buýt
+        story_good_guy = {
+            "title": "Kịch bản viral",
+            "cards": [
+                {"lines": [{"text": "Hôm nay tôi quyết định thử một lần làm người tốt bụng nhường ghế trên xe buýt."}]}
+            ]
+        }
+        res_gg = auto_publisher.generate_reel_caption(story_good_guy, api_key="invalid_dummy_key")
+        self.assertEqual(res_gg["title"], "Cái kết đắng khi thử làm người tốt")
+        self.assertNotIn("#", res_gg["title"])
+
+        # Chủ đề salon / cắt tóc
+        story_salon = {
+            "title": "",
+            "cards": [
+                {"lines": [{"text": "Hôm nay tôi quyết định ra tiệm salon lớn nhất phố để đổi một kiểu tóc thật ngầu."}]}
+            ]
+        }
+        res_salon = auto_publisher.generate_reel_caption(story_salon, api_key="invalid_dummy_key")
+        self.assertEqual(res_salon["title"], "Bài học nhớ đời khi đi đổi kiểu tóc")
+
+        # Chủ đề khóa học giảm cân
+        story_diet = {
+            "title": None,
+            "cards": [
+                {"lines": [{"text": "Hôm nay tôi quyết định tham gia một khóa học trực tuyến về phương pháp giảm cân khoa học."}]}
+            ]
+        }
+        res_diet = auto_publisher.generate_reel_caption(story_diet, api_key="invalid_dummy_key")
+        self.assertEqual(res_diet["title"], "Cú lừa ngoạn mục từ khóa học giảm cân")
+
+    def test_generate_reel_caption_with_gemini_mock(self):
+        """Kiểm tra tích hợp Gemini AI tạo tiêu đề & hook triệu view."""
+        story = {
+            "title": "Kịch bản viral",
+            "cards": [
+                {"lines": [{"text": "Hôm nay tôi quyết định đi bơi giữa mùa đông lạnh giá."}]},
+                {"lines": [{"text": "Vừa chạm chân xuống nước thì phát hiện hồ bơi đã cạn sạch từ tuần trước."}]}
+            ]
+        }
+        mock_response = MagicMock()
+        mock_response.parsed = {
+            "title": "Pha bơi lội bất ổn nhất mùa đông",
+            "hook": "Trời lạnh âm mười độ mà vẫn đam mê bơi lội và cái kết vỡ mộng!"
+        }
+        mock_response.text = json.dumps(mock_response.parsed)
+
+        with patch("google.genai.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.models.generate_content.return_value = mock_response
+            mock_client_cls.return_value = mock_client
+
+            res = auto_publisher.generate_reel_caption(story, api_key="test_api_key_123")
+            self.assertEqual(res["title"], "Pha bơi lội bất ổn nhất mùa đông")
+            self.assertIn("Trời lạnh âm mười độ", res["hook"])
+            self.assertIn("#Shorts", res["youtube_title"])
+            self.assertIn("#chuyenvuithoret", res["hashtags"])
+
+    async def test_upload_to_youtube_shorts_login_redirect_detection(self):
+        """Kiểm tra upload_to_youtube_shorts phát hiện chuyển hướng trang login và trả về thông báo lỗi rõ ràng."""
+        mock_page = MagicMock()
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://accounts.google.com/v3/signin/identifier?continue=https://studio.youtube.com"
+
+        mock_context = MagicMock()
+        mock_context.cookies = AsyncMock(return_value=[
+            {"name": "LOGIN_INFO", "domain": ".youtube.com", "value": "xyz"}
+        ])
+        mock_page.context = mock_context
+
+        with patch("asyncio.sleep", AsyncMock()):
+            result = await auto_publisher.upload_to_youtube_shorts(
+                mock_page,
+                Path("/tmp/fake_video.mp4"),
+                "Tiêu đề Shorts"
+            )
+            self.assertIn("Cookie YouTube hết hạn hoặc chưa đăng nhập", result)
+
+    async def test_upload_to_youtube_shorts_no_cookies_skip(self):
+        """Kiểm tra upload_to_youtube_shorts bỏ qua khi phiên trình duyệt không có cookie YouTube nào."""
+        mock_page = MagicMock()
+        mock_page.goto = AsyncMock()
+
+        mock_context = MagicMock()
+        # Không có cookie youtube.com hoặc google.com nào
+        mock_context.cookies = AsyncMock(return_value=[
+            {"name": "sessionid", "domain": ".tiktok.com", "value": "123"}
+        ])
+        mock_page.context = mock_context
+
+        with patch("asyncio.sleep", AsyncMock()):
+            result = await auto_publisher.upload_to_youtube_shorts(
+                mock_page,
+                Path("/tmp/fake_video.mp4"),
+                "Tiêu đề Shorts"
+            )
+            self.assertIn("Chưa có cookie YouTube", result)
+
+    async def test_dismiss_youtube_modals(self):
+        """Kiểm tra dismiss_youtube_modals xử lý các pop-up và hộp thoại tạo kênh."""
+        mock_page = MagicMock()
+        mock_page.keyboard.press = AsyncMock()
+
+        mock_button = MagicMock()
+        mock_button.count = AsyncMock(return_value=1)
+        mock_button.is_visible = AsyncMock(return_value=True)
+        mock_button.click = AsyncMock()
+        mock_button.nth = MagicMock(return_value=mock_button)
+
+        mock_dlg = MagicMock()
+        mock_dlg.count = AsyncMock(return_value=1)
+        mock_dlg.locator = MagicMock(return_value=mock_button)
+
+        def mock_locator(selector):
+            if "channel-creation" in selector:
+                return mock_dlg
+            return mock_button
+
+        mock_page.locator = MagicMock(side_effect=mock_locator)
+
+        with patch("asyncio.sleep", AsyncMock()):
+            await auto_publisher.dismiss_youtube_modals(mock_page)
+            self.assertTrue(mock_page.keyboard.press.called)
+
+    def test_generate_reel_caption_none_and_edge_cases(self):
+        """Kiểm tra generate_reel_caption xử lý an toàn khi story là None, rỗng hoặc tiêu đề chứa hashtag."""
+        # 1. story là None
+        res_none = auto_publisher.generate_reel_caption(None, api_key="invalid_dummy_key")
+        self.assertIn("title", res_none)
+        self.assertLessEqual(len(res_none["title"]), 60)
+        self.assertNotIn("#", res_none["title"])
+        self.assertIn("#Shorts", res_none["youtube_title"])
+
+        # 2. story rỗng {}
+        res_empty = auto_publisher.generate_reel_caption({}, api_key="invalid_dummy_key")
+        self.assertIn("title", res_empty)
+        self.assertLessEqual(len(res_empty["title"]), 60)
+
+        # 3. story có tiêu đề chứa sẵn hashtag và dài
+        story_tags = {
+            "title": "Chuyện tiệm cắt tóc siêu bất ổn #shorts #reels #viral #haihuoc",
+            "cards": []
+        }
+        res_tags = auto_publisher.generate_reel_caption(story_tags, api_key="invalid_dummy_key")
+        self.assertNotIn("#", res_tags["title"])
+        self.assertIn("Chuyện tiệm cắt tóc", res_tags["title"])
+        self.assertLessEqual(len(res_tags["title"]), 60)
+
+        # 4. story không có cards nhưng có content/text fallback
+        story_content = {
+            "title": "",
+            "content": "Hôm nay tôi quyết định tham gia một khóa học giảm cân cấp tốc."
+        }
+        res_content = auto_publisher.generate_reel_caption(story_content, api_key="invalid_dummy_key")
+        self.assertEqual(res_content["title"], "Cú lừa ngoạn mục từ khóa học giảm cân")
+
+    async def test_upload_to_youtube_shorts_empty_context_cookies_skip(self):
+        """Kiểm tra upload_to_youtube_shorts bỏ qua ngay khi danh sách context.cookies hoàn toàn rỗng."""
+        mock_page = MagicMock()
+        mock_page.goto = AsyncMock()
+
+        mock_context = MagicMock()
+        mock_context.cookies = AsyncMock(return_value=[])
+        mock_page.context = mock_context
+
+        with patch("asyncio.sleep", AsyncMock()):
+            result = await auto_publisher.upload_to_youtube_shorts(
+                mock_page,
+                Path("/tmp/fake_video.mp4"),
+                "Tiêu đề Shorts"
+            )
+            self.assertIn("Chưa có cookie YouTube", result)
+            self.assertFalse(mock_page.goto.called)
+
+    async def test_upload_to_youtube_shorts_generic_only_cookies_skip(self):
+        """Kiểm tra upload_to_youtube_shorts bỏ qua khi chỉ có cookie generic (PREF, YSC) mà không có auth key."""
+        mock_page = MagicMock()
+        mock_page.goto = AsyncMock()
+
+        mock_context = MagicMock()
+        mock_context.cookies = AsyncMock(return_value=[
+            {"name": "PREF", "domain": ".youtube.com", "value": "f1=50000000"},
+            {"name": "VISITOR_INFO1_LIVE", "domain": ".youtube.com", "value": "abc"}
+        ])
+        mock_page.context = mock_context
+
+        with patch("asyncio.sleep", AsyncMock()):
+            result = await auto_publisher.upload_to_youtube_shorts(
+                mock_page,
+                Path("/tmp/fake_video.mp4"),
+                "Tiêu đề Shorts"
+            )
+            self.assertIn("Chưa có cookie YouTube", result)
+            self.assertFalse(mock_page.goto.called)
+
+    def test_verify_youtube_session_online_logic(self):
+        """Kiểm tra logic verify_youtube_session_online với mock redirect HTTP và cache."""
+        auto_publisher._YT_VERIFY_CACHE.clear()
+
+        # Khi không có cookie
+        valid, msg = auto_publisher.verify_youtube_session_online([])
+        self.assertFalse(valid)
+        self.assertIn("Chưa có cookie", msg)
+
+        # Mock chuyển hướng tới Google sign-in
+        mock_err = urllib.error.HTTPError(
+            url="https://studio.youtube.com",
+            code=302,
+            msg="Found",
+            hdrs={"Location": "https://accounts.google.com/ServiceLogin?service=youtube"},
+            fp=None
+        )
+        fake_cookies = [{"name": "LOGIN_INFO", "domain": ".youtube.com", "value": "fake_login"}]
+        with patch("urllib.request.build_opener") as mock_opener:
+            mock_inst = MagicMock()
+            mock_inst.open.side_effect = mock_err
+            mock_opener.return_value = mock_inst
+
+            valid, msg = auto_publisher.verify_youtube_session_online(fake_cookies)
+            self.assertFalse(valid)
+            self.assertIn("Cookie YouTube hết hạn hoặc chưa đăng nhập", msg)
+
+            # Lần gọi tiếp theo lấy từ cache (không gọi urllib)
+            mock_inst.open.reset_mock()
+            valid_c, msg_c = auto_publisher.verify_youtube_session_online(fake_cookies)
+            self.assertFalse(valid_c)
+            self.assertFalse(mock_inst.open.called)
+
+    def test_clear_cookies_cleans_profile_sqlite(self):
+        """Kiểm tra clear_cookies xóa triệt để cả trong SQLite browser_profile/Default/Cookies."""
+        import sqlite3
+        profile_db_dir = self.test_profile_dir / "Default"
+        profile_db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = profile_db_dir / "Cookies"
+
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE cookies (host_key TEXT, name TEXT)")
+        cur.execute("INSERT INTO cookies VALUES ('.youtube.com', 'LOGIN_INFO')")
+        cur.execute("INSERT INTO cookies VALUES ('.tiktok.com', 'sessionid')")
+        conn.commit()
+        conn.close()
+
+        # Xóa cookie youtube
+        auto_publisher.clear_cookies(platform="youtube")
+
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute("SELECT host_key, name FROM cookies")
+        rows = cur.fetchall()
+        conn.close()
+
+        # Chỉ còn cookie tiktok, youtube đã bị xóa
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], ".tiktok.com")
+
+    def test_clean_word_truncation_no_split_words(self):
+        """Kiểm tra cắt tiêu đề > 60 ký tự theo ranh giới từ, không xé đôi từ."""
+        long_story = {
+            "title": "Hôm nay tôi quyết định tham gia một chuyến du lịch thám hiểm rừng sâu vô cùng kỳ lạ và bất ngờ",
+            "cards": [
+                {"lines": [{"text": "Hôm nay tôi quyết định tham gia một chuyến du lịch thám hiểm rừng sâu vô cùng kỳ lạ."}]}
+            ]
+        }
+        res = auto_publisher.generate_reel_caption(long_story, api_key="invalid_dummy_key")
+        title = res["title"]
+        self.assertLessEqual(len(title), 60)
+        self.assertNotIn("#", title)
+        if title.endswith("..."):
+            # Từ trước dấu ... phải là từ nguyên vẹn
+            stem = title[:-3].strip()
+            self.assertFalse(stem.endswith(" t"))  # Không cắt dở chữ cái
+            self.assertTrue(len(stem.split()[-1]) >= 2)
+
+    def test_generate_offline_caption_handles_sentence_raw_title(self):
+        """Kiểm tra _generate_offline_caption xử lý tiêu đề raw bắt đầu bằng 'Hôm nay tôi quyết định'."""
+        story = {
+            "title": "Hôm nay tôi quyết định đi mua một chú chó cảnh thật đắt tiền",
+            "cards": [
+                {"lines": [{"text": "Hôm nay tôi quyết định đi mua một chú chó cảnh thật đắt tiền."}]},
+                {"lines": [{"text": "Về đến nhà nó sủa tiếng meo làm cả nhà ngơ ngác."}]}
+            ]
+        }
+        res = auto_publisher.generate_reel_caption(story, api_key="invalid_dummy_key")
+        self.assertLessEqual(len(res["title"]), 60)
+        self.assertNotIn("#", res["title"])
+        self.assertNotIn("...", res["title"])
+        # Heuristic chó cảnh hoặc biến đổi 'Cái kết...'
+        self.assertTrue(
+            "chó" in res["title"].lower() or "cái kết" in res["title"].lower()
+        )
+
+    def test_verify_cache_cleared_on_save_and_clear(self):
+        """Kiểm tra _YT_VERIFY_CACHE được xóa sạch khi lưu hoặc xóa cookie."""
+        auto_publisher._YT_VERIFY_CACHE[12345] = (time.time(), True, "dummy")
+        self.assertIn(12345, auto_publisher._YT_VERIFY_CACHE)
+
+        auto_publisher.save_cookies([{"name": "LOGIN_INFO", "value": "123", "domain": ".youtube.com"}])
+        self.assertEqual(len(auto_publisher._YT_VERIFY_CACHE), 0)
+
+        auto_publisher._YT_VERIFY_CACHE[99999] = (time.time(), False, "expired")
+        self.assertIn(99999, auto_publisher._YT_VERIFY_CACHE)
+
+        auto_publisher.clear_cookies("youtube")
+        self.assertEqual(len(auto_publisher._YT_VERIFY_CACHE), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

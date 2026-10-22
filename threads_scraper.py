@@ -160,7 +160,7 @@ class ThreadCard(BaseModel):
 class StorySelection(BaseModel):
     selected_post_index: int = Field(description="Vị trí bài đăng được chọn trong danh sách")
     humor_score: int = Field(description="Điểm độ hài hước và bất ngờ từ 1 đến 10")
-    title: Optional[str] = Field(default="Kịch bản viral", description="Tiêu đề câu chuyện")
+    title: Optional[str] = Field(default="Kịch bản viral", description="Tiêu đề video ngắn hấp dẫn, tò mò, dưới 60 ký tự, tiếng Việt đầy đủ dấu, không chứa hashtag")
     cards: List[ThreadCard] = Field(description="Danh sách gồm đúng 2 card (Card 1 dẫn dắt, Card 2 chốt hạ)")
     use_video_meme_outro: bool = Field(
         default=True,
@@ -302,6 +302,7 @@ def select_and_format_story(
          * "wow": Sau lời khen hoặc chi tiết gây trầm trồ.
          * "none": Các câu bình thường không cần SFX.
     6. Thiết lập use_video_meme_outro: true để chèn clip meme reaction vào cuối video.
+    7. Đặt title: Tiêu đề video ngắn rõ ràng, cuốn hút, dưới 60 ký tự, tiếng Việt đầy đủ dấu UTF-8, tuyệt đối KHÔNG chứa hashtag.
     
     {posts_payload}
     """
