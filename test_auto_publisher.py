@@ -194,30 +194,40 @@ class TestAutoPublisher(unittest.IsolatedAsyncioTestCase):
 
     async def test_upload_to_tiktok_success(self):
         mock_page = MagicMock()
+        mock_page.url = "https://www.tiktok.com/tiktokstudio/upload"
+        mock_page.frames = []
         mock_page.goto = AsyncMock()
         mock_page.keyboard.press = AsyncMock()
         mock_page.keyboard.type = AsyncMock()
 
         mock_input = MagicMock()
         mock_input.set_input_files = AsyncMock()
+        mock_input.wait_for = AsyncMock()
+        mock_input.first = mock_input
 
         mock_caption = MagicMock()
         mock_caption.count = AsyncMock(return_value=1)
         mock_caption.click = AsyncMock()
+        mock_caption.first = mock_caption
 
         mock_btn = MagicMock()
         mock_btn.click = AsyncMock()
+        mock_btn.is_enabled = AsyncMock(return_value=True)
+        mock_btn.count = AsyncMock(return_value=1)
+        mock_btn.last = mock_btn
 
         def locator_side_effect(selector):
-            loc = MagicMock()
             if 'input[type="file"]' in selector:
                 return mock_input
-            elif 'contenteditable' in selector:
-                loc.first = mock_caption
-                return loc
-            elif 'button' in selector:
-                loc.last = mock_btn
-                return loc
+            elif "contenteditable" in selector or "textarea" in selector:
+                return mock_caption
+            elif "button" in selector:
+                return mock_btn
+            loc = MagicMock()
+            loc.first = loc
+            loc.last = loc
+            loc.count = AsyncMock(return_value=1)
+            loc.is_enabled = AsyncMock(return_value=True)
             return loc
 
         mock_page.locator.side_effect = locator_side_effect

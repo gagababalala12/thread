@@ -535,16 +535,29 @@ async def upload_to_tiktok(page, video_path: Path, caption: str) -> str:
     try:
         print("[TikTok] Đang truy cập TikTok Studio Upload...")
         await page.goto("https://www.tiktok.com/tiktokstudio/upload", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
 
-        # Tải file video lên thẻ input[type="file"]
-        file_input = page.locator('input[type="file"]')
+        # Kiểm tra xem có bị chuyển về trang login không
+        if "login" in page.url.lower():
+            return "❌ Lỗi (Cookie hết hạn hoặc chưa đăng nhập)"
+
+        # Tìm thẻ input[type="file"] (trên page hoặc iframe)
+        file_input = page.locator('input[type="file"]').first
+        try:
+            await file_input.wait_for(timeout=15000)
+        except Exception:
+            for frame in page.frames:
+                f_input = frame.locator('input[type="file"]').first
+                if await f_input.count() > 0:
+                    file_input = f_input
+                    break
+
         await file_input.set_input_files(str(video_path.resolve()))
         print("[TikTok] Đã nạp file video, đang chờ xử lý...")
         await asyncio.sleep(12)
 
         # Điền caption
-        caption_box = page.locator('div[contenteditable="true"]').first
+        caption_box = page.locator('div[contenteditable="true"], textarea').first
         if await caption_box.count() > 0:
             await caption_box.click()
             await page.keyboard.press("Control+A")
@@ -552,14 +565,23 @@ async def upload_to_tiktok(page, video_path: Path, caption: str) -> str:
             await page.keyboard.type(caption, delay=20)
 
         await asyncio.sleep(3)
-        # Bấm nút Đăng (Post)
+        # Chờ nút Đăng (Post) sẵn sàng
         post_btn = page.locator('button:has-text("Đăng"), button:has-text("Post")').last
-        await post_btn.click()
-        await asyncio.sleep(8)
-        return "✅ Đã đăng"
+        for _ in range(15):
+            if await post_btn.count() > 0 and await post_btn.is_enabled():
+                break
+            await asyncio.sleep(2)
+
+        if await post_btn.count() > 0:
+            await post_btn.click()
+            print("[TikTok] Đã bấm nút Đăng video!")
+            await asyncio.sleep(8)
+            return "✅ Đã đăng"
+        else:
+            return "❌ Lỗi (Không tìm thấy nút Đăng)"
     except Exception as e:
         print(f"[!] Lỗi đăng TikTok: {e}")
-        return f"❌ Lỗi ({str(e)[:25]}...)"
+        return f"❌ Lỗi ({str(e)[:30]}...)"
 
 async def upload_to_youtube_shorts(page, video_path: Path, title: str) -> str:
     try:
