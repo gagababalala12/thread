@@ -1021,6 +1021,111 @@ class TestAutoPublisher(unittest.IsolatedAsyncioTestCase):
         auto_publisher.clear_cookies("youtube")
         self.assertEqual(len(auto_publisher._YT_VERIFY_CACHE), 0)
 
+    def test_render_platform_cell_shows_retry_button_on_error(self):
+        """Kiểm tra render_platform_cell hiển thị nút Đăng lại khi có lỗi và có file video."""
+        test_video = self.test_published_dir / "test_retry.mp4"
+        test_video.write_bytes(b"dummy")
+
+        record = {
+            "id": 99,
+            "video_file": "test_retry.mp4",
+            "youtube": "❌ Lỗi (Cookie hết hạn)",
+            "tiktok": "✅ Đã đăng",
+            "facebook": "⏭️ Bỏ qua (Chưa có cookie)"
+        }
+
+        # YouTube có lỗi -> Phải có nút Đăng lại
+        yt_cell = auto_publisher.render_platform_cell(record, "youtube")
+        self.assertIn("btn-retry", yt_cell)
+        self.assertIn("retryPublish(99, 'youtube')", yt_cell)
+        self.assertIn("🔄 Đăng lại", yt_cell)
+
+        # TikTok đã đăng -> Không hiển thị nút Đăng lại
+        tt_cell = auto_publisher.render_platform_cell(record, "tiktok")
+        self.assertNotIn("btn-retry", tt_cell)
+
+        # Facebook bị bỏ qua -> Phải có nút Đăng lại
+        fb_cell = auto_publisher.render_platform_cell(record, "facebook")
+        self.assertIn("btn-retry", fb_cell)
+        self.assertIn("retryPublish(99, 'facebook')", fb_cell)
+
+        # Nếu file video không tồn tại -> Không hiển thị nút Đăng lại
+        record_no_file = {
+            "id": 100,
+            "video_file": "non_existent.mp4",
+            "youtube": "❌ Lỗi (Cookie hết hạn)"
+        }
+        no_file_cell = auto_publisher.render_platform_cell(record_no_file, "youtube")
+        self.assertNotIn("btn-retry", no_file_cell)
+
+    async def test_retry_publish_single_dry_run(self):
+        """Kiểm tra hàm retry_publish_single ở chế độ dry-run cập nhật trạng thái chuẩn xác."""
+        test_video = self.test_published_dir / "short_video_99.mp4"
+        test_video.write_bytes(b"dummy_mp4")
+
+        rec = {
+            "id": 99,
+            "created_at": "12:00 - 26/10/2026",
+            "title": "Bài kiểm tra retry publish",
+            "video_file": "short_video_99.mp4",
+            "youtube": "❌ Lỗi cũ",
+            "tiktok": "✅ Đã đăng",
+            "facebook": "⏭️ Bỏ qua cũ",
+            "overall_status": "Hoàn tất"
+        }
+        auto_publisher.save_status_record(rec)
+
+        res = await auto_publisher.retry_publish_single(99, "youtube", dry_run=True)
+        self.assertTrue(res["success"])
+
+        updated = auto_publisher.load_status_list()
+        target = next((item for item in updated if item["id"] == 99), None)
+        self.assertIsNotNone(target)
+        self.assertEqual(target["youtube"], "✅ Đã đăng")
+
+    def test_api_retry_publish_endpoint(self):
+        """Kiểm tra gọi endpoint /api/retry-publish qua HTTP."""
+        test_port = 18099
+        server = auto_publisher.ReusableHTTPServer(("127.0.0.1", test_port), auto_publisher.DashboardHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        try:
+            # Tạo record giả
+            rec = {
+                "id": 88,
+                "created_at": "12:00 - 26/10/2026",
+                "title": "Video test retry API",
+                "video_file": "short_88.mp4",
+                "youtube": "❌ Lỗi",
+                "tiktok": "❌ Lỗi",
+                "facebook": "❌ Lỗi",
+                "overall_status": "Lỗi"
+            }
+            auto_publisher.save_status_record(rec)
+
+            # Gọi POST /api/retry-publish
+            req_data = json.dumps({"id": 88, "platform": "youtube"}).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{test_port}/api/retry-publish",
+                data=req_data,
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(data.get("success"))
+                self.assertIn("video #88", data.get("message"))
+
+            # Kiểm tra trạng thái đã chuyển thành "⏳ Đang đăng lại..."
+            status_list = auto_publisher.load_status_list()
+            target = next((item for item in status_list if item["id"] == 88), None)
+            self.assertEqual(target["youtube"], "⏳ Đang đăng lại...")
+
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

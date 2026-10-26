@@ -1423,6 +1423,112 @@ async def publish_all_platforms(
 
         await context.close()
 
+async def retry_publish_single(video_id: int, platform: str, dry_run: bool = False) -> dict:
+    """Đăng lại một video cụ thể lên một hoặc tất cả các nền tảng khi có lỗi hoặc bị bỏ qua."""
+    records = load_status_list()
+    target_record = None
+    for r in records:
+        if r.get("id") == video_id:
+            target_record = r
+            break
+    if not target_record:
+        return {"success": False, "message": f"Không tìm thấy video #{video_id}"}
+
+    vfile = target_record.get("video_file", "")
+    video_path = None
+    if vfile:
+        cand1 = PUBLISHED_DIR / Path(vfile).name
+        cand2 = Path(vfile)
+        if cand1.exists():
+            video_path = cand1
+        elif cand2.exists():
+            video_path = cand2
+
+    if not video_path or not video_path.exists():
+        return {"success": False, "message": f"Không tìm thấy file video {vfile} trên máy"}
+
+    # Tái tạo caption & tiêu đề chuẩn Reels/Shorts từ title kịch bản
+    story_mock = {"title": target_record.get("title", ""), "cards": []}
+    caption_data = generate_reel_caption(story_mock)
+    caption = caption_data.get("full_caption") or f"{target_record.get('title', '')} #shorts #reels #haihuoc #xuhuong"
+    yt_title = caption_data.get("title") or target_record.get("title", "")
+
+    if dry_run:
+        if platform in ["youtube", "all"]:
+            target_record["youtube"] = "✅ Đã đăng"
+        if platform in ["tiktok", "all"]:
+            target_record["tiktok"] = "✅ Đã đăng"
+        if platform in ["facebook", "all"]:
+            target_record["facebook"] = "✅ Đã đăng"
+        save_status_record(target_record)
+        return {"success": True, "message": f"[Dry-Run] Đã đăng lại video #{video_id} lên {platform}!"}
+
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR.resolve()),
+            headless=True,
+            viewport={"width": 1280, "height": 800},
+            locale="vi-VN",
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
+
+        saved_cookies = load_saved_cookies()
+        if saved_cookies:
+            await safe_add_cookies(context, saved_cookies)
+
+        page = await context.new_page()
+
+        # 1. YouTube Shorts
+        if platform in ["youtube", "all"]:
+            target_record["youtube"] = "⏳ Đang đăng lại..."
+            save_status_record(target_record)
+            ctx_cookies = await context.cookies()
+            check_cookies = saved_cookies if saved_cookies else ctx_cookies
+            is_valid, verify_msg = verify_youtube_session_online(check_cookies)
+            if is_valid is False:
+                target_record["youtube"] = "❌ Lỗi (Cookie YouTube hết hạn hoặc chưa đăng nhập)"
+            else:
+                target_record["youtube"] = await upload_to_youtube_shorts(page, video_path, yt_title)
+            save_status_record(target_record)
+
+        # 2. TikTok Studio
+        if platform in ["tiktok", "all"]:
+            target_record["tiktok"] = "⏳ Đang đăng lại..."
+            save_status_record(target_record)
+            target_record["tiktok"] = await upload_to_tiktok(page, video_path, caption)
+            save_status_record(target_record)
+
+        # 3. Facebook Reels
+        if platform in ["facebook", "all"]:
+            target_record["facebook"] = "⏳ Đang đăng lại..."
+            save_status_record(target_record)
+            target_record["facebook"] = await upload_to_facebook_reels(page, video_path, caption)
+            save_status_record(target_record)
+
+        # Cập nhật tổng thể
+        posted = [
+            name for name, val in [
+                ("YouTube", target_record.get("youtube", "")),
+                ("TikTok", target_record.get("tiktok", "")),
+                ("Facebook", target_record.get("facebook", ""))
+            ] if "Đã đăng" in val
+        ]
+        if posted:
+            target_record["overall_status"] = f"Hoàn tất (Đã đăng {', '.join(posted)})"
+        save_status_record(target_record)
+
+        try:
+            current_cookies = await context.cookies()
+            if current_cookies:
+                save_cookies(current_cookies)
+        except Exception:
+            pass
+
+        await context.close()
+
+    return {"success": True, "message": f"Đã thực hiện xong đăng lại video #{video_id} lên {platform}!"}
+
 # ==========================================
 # 4. GIAO DIỆN WEB DASHBOARD (PORT 8080)
 # ==========================================
@@ -1440,6 +1546,26 @@ def render_badge(status_text: str) -> str:
     else:
         bg, color = "#334155", "#cbd5e1"
     return f'<span class="badge" style="background:{bg};color:{color}">{status}</span>'
+
+def render_platform_cell(record: dict, platform: str) -> str:
+    """Hiển thị badge trạng thái kèm nút 'Đăng lại' nếu có lỗi hoặc chưa đăng thành công."""
+    status = str(record.get(platform, "-"))
+    badge = render_badge(status)
+    video_id = record.get("id")
+    vfile = record.get("video_file", "")
+    has_video = (PUBLISHED_DIR / Path(vfile).name).exists() or Path(vfile).exists()
+
+    # Điều kiện hiển thị nút đăng lại: Có file video, và chưa ở trạng thái "Đã đăng" hoặc đang đăng dở
+    can_retry = has_video and ("Đã đăng" not in status) and ("Đang" not in status)
+    if can_retry:
+        btn_retry = (
+            f'<div style="margin-top:5px">'
+            f'<button class="btn-retry" onclick="retryPublish({video_id}, \'{platform}\')" '
+            f'title="Bấm để đăng lại video này lên {platform.capitalize()}">🔄 Đăng lại</button>'
+            f'</div>'
+        )
+        return f'<div class="cell-platform">{badge}{btn_retry}</div>'
+    return f'<div class="cell-platform">{badge}</div>'
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -1599,9 +1725,9 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
                 <td><strong>#{r.get('id', '-')}</strong></td>
                 <td><small style="color:#94a3b8">{r.get('created_at', '-')}</small></td>
                 <td><div class="story-title" title="{r.get('title', '-')}">{r.get('title', '-')}</div><small style="color:#60a5fa">{vfile}</small></td>
-                <td>{render_badge(r.get('youtube', '-'))}</td>
-                <td>{render_badge(r.get('facebook', '-'))}</td>
-                <td>{render_badge(r.get('tiktok', '-'))}</td>
+                <td>{render_platform_cell(r, 'youtube')}</td>
+                <td>{render_platform_cell(r, 'facebook')}</td>
+                <td>{render_platform_cell(r, 'tiktok')}</td>
                 <td>{render_badge(r.get('overall_status', '-'))}</td>
                 <td style="text-align:center">{action_btn}</td>
             </tr>
@@ -1680,6 +1806,11 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
         .btn-action:hover {{ background: #2563eb; }}
         .btn-danger {{ background: #dc2626; color: white; border: none; padding: 10px 18px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px; }}
         .btn-danger:hover {{ background: #b91c1c; }}
+        
+        .cell-platform {{ display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }}
+        .btn-retry {{ background: #4338ca; color: #e0e7ff; border: 1px solid #6366f1; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }}
+        .btn-retry:hover {{ background: #4f46e5; color: #ffffff; border-color: #818cf8; transform: translateY(-1px); box-shadow: 0 2px 6px rgba(99, 102, 241, 0.4); }}
+        .btn-retry:active {{ transform: translateY(0); }}
         
         /* Modal Player */
         .modal {{ display: none; position: fixed; z-index: 999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); align-items: center; justify-content: center; }}
@@ -2043,6 +2174,37 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
                 console.error("Lỗi lấy trạng thái:", e);
             }}
         }}
+        async function retryPublish(id, platform) {{
+            const platformNames = {{
+                'youtube': 'YouTube Shorts',
+                'tiktok': 'TikTok Studio',
+                'facebook': 'Facebook Reels',
+                'all': 'Tất cả các nền tảng'
+            }};
+            const pName = platformNames[platform] || platform;
+            if (!confirm(`Bạn có chắc muốn đăng lại video #${{id}} lên ${{pName}}?`)) {{
+                return;
+            }}
+
+            try {{
+                const resp = await fetch("/api/retry-publish", {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{ id: id, platform: platform }})
+                }});
+                const data = await resp.json();
+                if (data.success) {{
+                    alert(data.message || `Đang bắt đầu đăng lại video #${{id}} lên ${{pName}}!`);
+                    setTimeout(() => {{
+                        window.location.reload();
+                    }}, 800);
+                }} else {{
+                    alert("Lỗi: " + (data.message || "Không thể thực hiện đăng lại"));
+                }}
+            }} catch (err) {{
+                alert("Lỗi kết nối máy chủ: " + err);
+            }}
+        }}
     </script>
 </body>
 </html>"""
@@ -2139,6 +2301,66 @@ Write-Host "`n[OK] Da mo cac tab dang nhap!"
                     "success": True,
                     "message": f"Đã xóa cookie ({platform}) thành công!",
                     "auth": auth_info
+                }, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(res_body)))
+                self.end_headers()
+                self.wfile.write(res_body)
+                return
+            except Exception as e:
+                res_body = json.dumps({"success": False, "message": str(e)}, ensure_ascii=False).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(res_body)))
+                self.end_headers()
+                self.wfile.write(res_body)
+                return
+
+        if self.path == "/api/retry-publish":
+            try:
+                data = json.loads(body) if body else {}
+                video_id = int(data.get("id", 0))
+                platform = str(data.get("platform", "all")).lower()
+
+                records = load_status_list()
+                found = False
+                for r in records:
+                    if r.get("id") == video_id:
+                        found = True
+                        if platform in ["youtube", "all"]:
+                            r["youtube"] = "⏳ Đang đăng lại..."
+                        if platform in ["tiktok", "all"]:
+                            r["tiktok"] = "⏳ Đang đăng lại..."
+                        if platform in ["facebook", "all"]:
+                            r["facebook"] = "⏳ Đang đăng lại..."
+                        save_status_record(r)
+                        break
+
+                if not found:
+                    res_body = json.dumps({"success": False, "message": f"Không tìm thấy video #{video_id}"}, ensure_ascii=False).encode("utf-8")
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(res_body)))
+                    self.end_headers()
+                    self.wfile.write(res_body)
+                    return
+
+                # Khởi chạy đăng lại trong background thread
+                def run_retry():
+                    asyncio.run(retry_publish_single(video_id, platform))
+
+                threading.Thread(target=run_retry, daemon=True).start()
+
+                p_names = {"youtube": "YouTube Shorts", "tiktok": "TikTok Studio", "facebook": "Facebook Reels", "all": "tất cả nền tảng"}
+                res_body = json.dumps({
+                    "success": True,
+                    "message": f"Đang bắt đầu đăng lại video #{video_id} lên {p_names.get(platform, platform)}!",
+                    "id": video_id,
+                    "platform": platform
                 }, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
