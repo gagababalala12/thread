@@ -376,8 +376,9 @@ async def generate_tts(text: str, output_path: Path, max_retries: int = 5, voice
     last_error = None
     for attempt in range(max_retries):
         chosen_voice = voices[attempt % len(voices)]
+        rate = CONFIG["voice_rate"] if attempt < 2 else "+0%"
         try:
-            communicate = edge_tts.Communicate(text=norm_text, voice=chosen_voice, rate=CONFIG["voice_rate"])
+            communicate = edge_tts.Communicate(text=norm_text, voice=chosen_voice, rate=rate)
             await communicate.save(str(output_path))
             if output_path.exists() and output_path.stat().st_size > 0:
                 return
@@ -385,11 +386,22 @@ async def generate_tts(text: str, output_path: Path, max_retries: int = 5, voice
         except Exception as e:
             last_error = e
             if attempt < max_retries - 1:
-                wait_time = 1.5 * (attempt + 1)
+                wait_time = 2.0 * (attempt + 1)
                 print(f"[!] TTS thử lại lần {attempt + 1} sau {wait_time:.1f}s cho câu: '{norm_text[:30]}...'")
                 await asyncio.sleep(wait_time)
-            else:
-                raise RuntimeError(f"Không thể tạo âm thanh TTS sau {max_retries} lần thử: {last_error}")
+
+    # Dự phòng cứu cánh gTTS nếu Microsoft Edge-TTS bị nghẽn
+    try:
+        from gtts import gTTS
+        print(f"[!] Chuyển sang gTTS dự phòng cho câu: '{norm_text[:30]}...'")
+        tts = gTTS(text=norm_text, lang='vi')
+        tts.save(str(output_path))
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return
+    except Exception as g_err:
+        print(f"[!] Lỗi gTTS dự phòng: {g_err}")
+
+    raise RuntimeError(f"Không thể tạo âm thanh TTS sau {max_retries} lần thử: {last_error}")
 
 
 def trim_audio_silence(file_path: Path, silence_thresh: int = -40, padding_ms: int = 80):

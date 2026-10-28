@@ -2584,6 +2584,12 @@ async def run_single_cycle(video_counter: int, dry_run: bool = False) -> dict:
     except Exception as e:
         print(f"[!] [Chu kỳ #{video_counter}] Lỗi xảy ra: {e}")
         record["overall_status"] = f"❌ Lỗi: {str(e)[:40]}"
+        if record.get("youtube") == "⏳ Chờ video":
+            record["youtube"] = "❌ Lỗi tạo video"
+        if record.get("facebook") == "⏳ Chờ video":
+            record["facebook"] = "❌ Lỗi tạo video"
+        if record.get("tiktok") == "⏳ Chờ video":
+            record["tiktok"] = "❌ Lỗi tạo video"
         save_status_record(record)
 
     return record
